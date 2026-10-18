@@ -14,7 +14,7 @@ from dio import Fig, Plot, legend
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, '..', 'figures')
 N = json.load(open(os.path.join(HERE, 'numbers.json')))
-S = pickle.load(open(os.path.join(HERE, 'series.pkl'), 'rb'))
+S = pickle.load(open(os.path.join(HERE, 'series.pkl'), 'rb')) if os.path.exists(os.path.join(HERE, 'series.pkl')) else {}   # per-query series for the distribution plots; the paper's figures need only numbers.json
 
 # one colour per method family, the same in every figure (validated with the dataviz palette checker)
 C = {'rptg': '#1f6fd0', 'static': '#a9bdd6', 'yann': '#5b7fae', 'rptplus': '#1b3a6b', 'exact': '#d3dce8',
