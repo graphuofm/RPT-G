@@ -79,7 +79,7 @@ Patch: `hosts/kuzu/rptg_stage_a.patch` against Kùzu v0.11.3 (branch `rptg` in `
 
 ## Evaluation tooling (2026-09-21)
 - Python binding of the modified build: `make python` -> `ext/kuzu/tools/python_api/build` (cp311; run with
-  `PYTHONPATH=ext/kuzu/tools/python_api/build ~/miniconda3/envs/rptg-build/bin/python scripts/run_kuzu.py ...`).
+  `PYTHONPATH=ext/kuzu/tools/python_api/build python scripts/run_kuzu.py ...`).
 - `run_kuzu.py --configs KNO:0:0,KSM:1:0,KRG:0:1` interleaves no-mask / Kùzu semi-mask / RPT-G per rep.
   `--buffer-gb` bounds the buffer pool: Kùzu defaults to 80% of RAM per process, which got two of
   three shards OOM-killed in the first K0 attempt.

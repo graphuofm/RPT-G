@@ -11,10 +11,10 @@ the same fix as our `applySemiMaskRowFilter` upstream), so no `exact_semi_mask` 
 ## Build
 
 ```
-conda activate rptg-build
+# toolchain: GCC 11 or newer, cmake, ninja, Python 3.11 (see the root README)
 cd ext/ladybug && git submodule update --init tools/python_api
 git apply ../../hosts/ladybug/rptg_stage_e.patch
-OPENSSL_ROOT_DIR=~/miniconda3/envs/rptg-build nice -n 19 make python NUM_THREADS=10   # module `ladybug` (_lbug.so)
+nice -n 19 make python NUM_THREADS=10   # module `ladybug` (_lbug.so)
 ```
 
 ## Load and run
@@ -24,8 +24,8 @@ same arguments and config strings as in `hosts/kuzu/README.md`.
 
 ```
 export PYTHONPATH=ext/ladybug/tools/python_api/build
-~/miniconda3/envs/rptg-build/bin/python scripts/ladybug_load.py data/bin/dblp data/ladybug/dblp.lb
-~/miniconda3/envs/rptg-build/bin/python scripts/run_ladybug.py --db data/ladybug/dblp.lb \
+python scripts/ladybug_load.py data/bin/dblp data/ladybug/dblp.lb
+python scripts/run_ladybug.py --db data/ladybug/dblp.lb \
     --queries queries/qgen_dblp_300.txt --out results/ladybug_dblp300.csv \
     --configs KNO:0:0,KSM:1:0,KR2:0:2:1.0 --reps 3 --warm 1 --threads 8 --timeout 10
 ```

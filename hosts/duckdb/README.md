@@ -84,14 +84,14 @@ cd ext/rptplus && git apply ../../hosts/duckdb/rptg_stage2.patch && make release
 ## Load and run
 
 ```
-~/miniconda3/bin/python scripts/export_parquet.py data/bin/dblp        # V.parquet / E.parquet
-RPTG_MODE=0 ~/miniconda3/bin/python scripts/run_duckdb_cli.py --bin ext/duckdb130/duckdb \
+python scripts/export_parquet.py data/bin/dblp        # V.parquet / E.parquet
+RPTG_MODE=0 python scripts/run_duckdb_cli.py --bin ext/duckdb130/duckdb \
     --graph data/bin/dblp --db data/bin/dblp/dblp_130.db --queries queries/qgen_dblp_300.txt \
     --out results/duckdb300_vanilla.csv --method vanilla --reps 3 --warm 1 --threads 8 --timeout 10
-RPTG_MODE=1 RPTG_BETA=1.0 ~/miniconda3/bin/python scripts/run_duckdb_cli.py --bin ext/rptplus/build/release/duckdb \
+RPTG_MODE=1 RPTG_BETA=1.0 python scripts/run_duckdb_cli.py --bin ext/rptplus/build/release/duckdb \
     --graph data/bin/dblp --db data/bin/dblp/dblp_rptplus.db --queries queries/qgen_dblp_300.txt \
     --out results/duckdb300_rptg.csv --method rptg --reps 3 --warm 1 --threads 8 --timeout 10
-~/miniconda3/bin/python scripts/analyze_cli.py vanilla=results/duckdb300_vanilla.csv \
+python scripts/analyze_cli.py vanilla=results/duckdb300_vanilla.csv \
     rptplus=results/duckdb300_rptplus.csv rptg=results/duckdb300_rptg.csv fork=results/duckdb300_fork.csv \
     --meta queries/qgen_dblp.txt.meta.csv
 ```
@@ -100,10 +100,10 @@ Several configurations interleaved per query (the protocol for every result repo
 query and configuration, `method` = configuration name), then analysed from the one CSV:
 
 ```
-~/miniconda3/bin/python scripts/run_duckdb_cli.py --graph data/bin/dblp --queries queries/qgen_dblp_300.txt \
+python scripts/run_duckdb_cli.py --graph data/bin/dblp --queries queries/qgen_dblp_300.txt \
     --configs vanilla:ext/duckdb130/duckdb:data/bin/dblp/dblp_130.db:0:1.0,rptplus:$F:$D:0:1.0,fork:$F:$D:1:0,rptg:$F:$D:1:1.0 \
     --out results/duckdb300_4way.csv --reps 3 --warm 1 --threads 8 --timeout 10
-~/miniconda3/bin/python scripts/analyze_cli.py fork=results/duckdb300_4way.csv rptplus=results/duckdb300_4way.csv \
+python scripts/analyze_cli.py fork=results/duckdb300_4way.csv rptplus=results/duckdb300_4way.csv \
     rptg=results/duckdb300_4way.csv vanilla=results/duckdb300_4way.csv
 ```
 

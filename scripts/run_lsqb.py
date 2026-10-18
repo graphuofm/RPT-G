@@ -10,10 +10,10 @@ Output CSV: engine,sf,query,rep,status,total_ms,count -- one row per timed repet
 plus one row with rep=median per (engine, sf, query). status: ok | wrong (count differs from LSQB's
 expected count) | timeout | error | crash. A timeout counts as the timeout in the median.
 
-    PY=~/miniconda3/bin/python
+    PY=python
     $PY scripts/run_lsqb.py --engines kuzu,duckdb --sfs 0.1,0.3,1,3 --out results/lsqb_baseline.csv
     # patched Kuzu build with RPT-G settings, labelled separately:
-    PYTHONPATH=ext/kuzu/tools/python_api/build ~/miniconda3/envs/rptg-build/bin/python scripts/run_lsqb.py \
+    PYTHONPATH=ext/kuzu/tools/python_api/build python scripts/run_lsqb.py \
         --engines kuzu --label KR2 --kuzu-calls 'enable_semi_mask=false;rptg_mode=2;rptg_beta=1.0' --out ...
 """
 import argparse, os, queue, re, statistics, subprocess, sys, threading, time

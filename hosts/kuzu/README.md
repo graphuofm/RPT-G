@@ -62,7 +62,7 @@ which finish), < 0.8x 3.5% against a noise floor of 7.1%, counts identical to KN
 ## Build
 
 ```
-conda activate rptg-build            # GCC 13, cmake, ninja
+# toolchain: GCC 11 or newer, cmake, ninja, Python 3.11 (see the root README)
 cd ext/kuzu && git checkout v0.11.3 && git apply ../../hosts/kuzu/rptg_stage_g.patch
 ln -s ../../../prototype/src third_party/rptg   # the shared core, compiled into kuzu_optimizer
 make python NUM_THREADS=28           # -> tools/python_api/build (module `kuzu`)
@@ -71,7 +71,7 @@ make python NUM_THREADS=28           # -> tools/python_api/build (module `kuzu`)
 ## Load and run
 
 ```
-PY=~/miniconda3/envs/rptg-build/bin/python
+PY=python
 export PYTHONPATH=ext/kuzu/tools/python_api/build
 $PY scripts/kuzu_load.py data/bin/dblp data/kuzu/dblp.kz        # V(id, pu, pd, label), E(FROM V TO V)
 $PY scripts/run_kuzu.py --db data/kuzu/dblp.kz --queries queries/test_small.txt \

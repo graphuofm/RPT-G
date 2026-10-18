@@ -9,7 +9,7 @@ LSQB's ladybug/convert.sh + load.py do. Instead of writing concatenated CSVs nex
 convert.sh does) the loader COPYs from lists of files and loads the reversed knows edges through
 LOAD FROM, so data/raw stays untouched.
 
-    PY=~/miniconda3/bin/python          # official kuzu 0.11.3 wheel
+    PY=python          # official kuzu 0.11.3 wheel
     $PY scripts/lsqb_kuzu_load.py 0.1   # -> data/kuzu/lsqb_sf0.1.kz
 
 The database files are also opened by the patched build (ext/kuzu/tools/python_api/build).

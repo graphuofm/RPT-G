@@ -48,9 +48,9 @@ the plan of `SELECT <count>::int8` (a `Result` node). `rptg.count = off` disable
 ```
 make -C hosts/pg19/pg_rptg && make -C hosts/pg19/pg_rptg install
 scripts/pg19_ctl.sh start                                   # port 5439, socket in data/pg19/cluster
-~/miniconda3/bin/python scripts/pg19_load.py data/bin/dblp dblp
+python scripts/pg19_load.py data/bin/dblp dblp
 scripts/pg19_ctl.sh psql dblp -c "CREATE EXTENSION pg_rptg" -c "ALTER DATABASE dblp SET session_preload_libraries='pg_rptg'"
-~/miniconda3/bin/python scripts/run_pg.py --db dblp --queries queries/test_small.txt --configs "PGNO:,PGR:rptg.enabled=on"
+python scripts/run_pg.py --db dblp --queries queries/test_small.txt --configs "PGNO:,PGR:rptg.enabled=on"
 ```
 
 Runs: `scripts/pg19_all.sh` (join-order robustness with `--orders` and `join_collapse_limit=1`, the 300-query sample,

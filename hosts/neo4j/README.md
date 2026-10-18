@@ -9,8 +9,8 @@ Install: `ext/neo4j` = neo4j-community-5.26.0, OpenJDK 21 from the conda env `ne
 off, 8 GB heap, 8 GB page cache, `db.transaction.timeout=10s`, default database `dblp`.
 
 ```
-export JAVA_HOME=~/miniconda3/envs/neo4j PATH=~/miniconda3/envs/neo4j/bin:$PATH
-~/miniconda3/bin/python scripts/neo4j_export_csv.py data/bin/dblp data/neo4j_csv/dblp
+export JAVA_HOME=<a JDK 17>
+python scripts/neo4j_export_csv.py data/bin/dblp data/neo4j_csv/dblp
 cd ext/neo4j
 bin/neo4j-admin database import full --nodes=V=$PWD/../../data/neo4j_csv/dblp/V.csv \
     --relationships=E=$PWD/../../data/neo4j_csv/dblp/E.csv --overwrite-destination dblp
@@ -21,7 +21,7 @@ bin/neo4j start
 Run (`neo4j` Python driver in the same conda env):
 
 ```
-~/miniconda3/envs/neo4j/bin/python scripts/run_neo4j.py --database dblp --queries queries/test_small.txt \
+python scripts/run_neo4j.py --database dblp --queries queries/test_small.txt \
     --reps 2 --warm 1 --timeout 10 --out results/neo4j_test.csv
 scripts/run_neo4j_sharded.sh dblp results/shards_neo4j_dblp results/neo4j_dblp_qgen.csv --reps 2 --warm 1 --timeout 10
 ```

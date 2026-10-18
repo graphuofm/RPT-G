@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Statistics of the LSQB data sets and of the attributes available for predicates (markdown to stdout).
 
-    PY=~/miniconda3/bin/python
+    PY=python
     $PY scripts/lsqb_stats.py counts  --sfs 0.1,0.3,1,3        # vertex/edge counts and sizes per SF
     $PY scripts/lsqb_stats.py degrees --sfs 0.1,1,3            # out/in-degree max and mean per edge type
     $PY scripts/lsqb_stats.py attrs   --bi data/raw/snb_bi/bi-sf1-composite-merged-fk --lsqb-sf 1
