@@ -1,7 +1,7 @@
 # RPT-G in Kùzu — integration notes
 
 Host: Kùzu v0.11.3 (archived upstream 2025-10-10; LadybugDB is the maintained fork, port later).
-Source + build: `ext/kuzu` (conda env `rptg-build`, GCC 13: `make release NUM_THREADS=28`),
+Source + build: `ext/kuzu` (GCC 13: `make release NUM_THREADS=28`),
 shell at `ext/kuzu/build/release/tools/shell/kuzu`. Official wheel `kuzu==0.11.3` in conda base for
 baselines. Databases in `data/kuzu/*.kz` (`scripts/kuzu_load.py`), runner `scripts/run_kuzu.py`
 (Cypher, walk semantics = homomorphisms; counts match the prototype on the 8 test queries).
