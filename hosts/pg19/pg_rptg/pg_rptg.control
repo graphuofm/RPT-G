@@ -1,0 +1,4 @@
+comment = 'RPT-G: robust predicate transfer for graph pattern queries'
+default_version = '1.0'
+module_pathname = '$libdir/pg_rptg'
+relocatable = true

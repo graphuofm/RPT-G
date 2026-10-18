@@ -1,0 +1,88 @@
+{
+ "host_robust": {
+  "duckdb_dblp_robust": {
+   "dk0": {
+    "best_sum_s": 5.646,
+    "factor_geo": 6.733003935461205,
+    "median_sum_s": 46.5265,
+    "timeouts": 50,
+    "worst_sum_s": 140.044,
+    "worst_vs_base_best": 6.733003935461205
+   },
+   "dkr": {
+    "best_sum_s": 4.418,
+    "factor_geo": 3.185395265018993,
+    "median_sum_s": 10.9545,
+    "pair_geo": 1.6553762988875347,
+    "pair_gt10": 9.749739311783108,
+    "pair_gt2": 19.86444212721585,
+    "pair_lt08": 2.867570385818561,
+    "timeouts": 0,
+    "worst_sum_s": 19.763,
+    "worst_vs_base_best": 2.8680984970703625
+   },
+   "pairs": 1918,
+   "queries": 100
+  },
+  "kuzu_dblp_robust": {
+   "KNO": {
+    "best_sum_s": 36.6969541,
+    "factor_geo": 4.502191603621803,
+    "median_sum_s": 93.40405154999999,
+    "timeouts": 88,
+    "worst_sum_s": 304.4382472,
+    "worst_vs_base_best": 4.502191603621803
+   },
+   "KR2": {
+    "best_sum_s": 13.4816336,
+    "factor_geo": 5.10888428537304,
+    "median_sum_s": 27.862071700000005,
+    "pair_geo": 8.17463967342498,
+    "pair_gt10": 50.417101147028156,
+    "pair_gt2": 85.50573514077163,
+    "pair_lt08": 0.0,
+    "timeouts": 23,
+    "worst_sum_s": 140.3840332,
+    "worst_vs_base_best": 0.8951498042453606
+   },
+   "KSM": {
+    "best_sum_s": 18.403505300000003,
+    "factor_geo": 10.866645830693411,
+    "median_sum_s": 61.20261504999999,
+    "pair_geo": 2.541324317683515,
+    "pair_gt10": 15.849843587069865,
+    "pair_gt2": 44.57768508863399,
+    "pair_lt08": 4.535974973931179,
+    "timeouts": 59,
+    "worst_sum_s": 257.8881870999999,
+    "worst_vs_base_best": 3.5289311192395947
+   },
+   "pairs": 1918,
+   "queries": 100
+  },
+  "pg19_dblp_robust": {
+   "PGNO": {
+    "best_sum_s": 41.1835833,
+    "factor_geo": 43.23160617246139,
+    "median_sum_s": 255.23269385,
+    "timeouts": 462,
+    "worst_sum_s": 461.91717399999993,
+    "worst_vs_base_best": 43.23160617246139
+   },
+   "PGR": {
+    "best_sum_s": 28.100124000000005,
+    "factor_geo": 10.678533814521522,
+    "median_sum_s": 77.365981,
+    "pair_geo": 4.8307811357673796,
+    "pair_gt10": 27.78936392075078,
+    "pair_gt2": 51.981230448383734,
+    "pair_lt08": 1.5641293013555788,
+    "timeouts": 142,
+    "worst_sum_s": 169.40274760000003,
+    "worst_vs_base_best": 8.43903780425084
+   },
+   "pairs": 1918,
+   "queries": 100
+  }
+ }
+}

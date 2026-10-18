@@ -1,0 +1,274 @@
+$ python scripts/analyze_host.py results/kuzu_dblp_3way_e.csv --base KNO
+results/kuzu_dblp_3way_e.csv: 5000 queries with all configs (0 missing a config: crash); status counts:
+status  error     ok  timeout
+method                       
+KNO         4  14079      303
+KR2         9  14201      258
+KSM        17  14154      265
+count mismatches vs KNO : {'KR2': 0, 'KSM': 0}
+baseline KNO: 4693 evaluated (307 baseline timeouts excluded)
+noise floor (KNO rep vs rep): <0.8 9.6%  <0.5 0.0%  >1.25 9.2%  >2 0.0%
+config     <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new
+KNO        0.0%   0.0%   0.0%   0.0%    1.000   1.00   1.00   1.00   1071.9  307    0/0   
+KR2        4.6%   0.0%  56.0%  41.1%    1.920   0.81   1.45   8.07    688.3  267   40/0   
+KSM       17.3%   5.1%  20.5%  11.5%    1.070   0.50   1.00   3.17   1209.6  282   44/19  
+by baseline time (geomean, share < 0.8x):
+      0-   20 ms n=1183  KR2: 0.97 (15%)  KSM: 0.94 (18%)
+     20-  100 ms n=1832  KR2: 2.19 (2%)  KSM: 1.23 (17%)
+    100- 1000 ms n=1476  KR2: 2.80 (0%)  KSM: 1.02 (16%)
+   1000-  inf ms n= 202  KR2: 2.03 (0%)  KSM: 0.90 (26%)
+worst KR2 queries (speedup):
+       KNO   KR2   KSM  speedup
+qid                            
+1257  19.1  35.1  21.5     0.55
+125    3.8   6.8   4.9     0.56
+1661  13.9  24.8  22.2     0.56
+3446   4.8   8.5   6.0     0.57
+1582   5.0   8.6   7.0     0.58
+4647  11.3  18.7  27.8     0.60
+1452  11.4  18.5  12.2     0.62
+4975   8.6  14.0  13.3     0.62
+
+$ python scripts/analyze_host.py results/kuzu_lj_3way_e.csv --base KNO
+results/kuzu_lj_3way_e.csv: 4989 queries with all configs (0 missing a config: crash); status counts:
+status  error     ok  timeout
+method                       
+KNO       149  11247     1094
+KR2       137  11491     1026
+KSM       206  11373      997
+count mismatches vs KNO : {'KR2': 0, 'KSM': 0}
+baseline KNO: 3746 evaluated (1243 baseline timeouts excluded)
+noise floor (KNO rep vs rep): <0.8 3.5%  <0.5 0.0%  >1.25 4.0%  >2 0.1%
+config     <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new
+KNO        0.0%   0.0%   0.0%   0.0%    1.000   1.00   1.00   1.00   3693.4 1243    0/0   
+KR2        4.5%   0.4%  56.0%  40.2%    2.189   0.82   1.46  18.89   1902.3 1163   83/3   
+KSM       29.5%  15.1%  11.7%   4.0%    0.856   0.30   0.97   1.78   4415.0 1203   67/27  
+by baseline time (geomean, share < 0.8x):
+      0-   20 ms n= 375  KR2: 0.99 (4%)  KSM: 0.99 (6%)
+     20-  100 ms n= 663  KR2: 0.99 (17%)  KSM: 0.82 (37%)
+    100- 1000 ms n=1660  KR2: 3.05 (2%)  KSM: 0.81 (31%)
+   1000-  inf ms n=1048  KR2: 2.84 (0%)  KSM: 0.92 (31%)
+worst KR2 queries (speedup):
+        KNO      KR2      KSM  speedup
+qid                                   
+3321  743.8  10000.0  10000.0     0.07
+1108   27.4    108.5     87.1     0.25
+1827   39.3    111.6     95.2     0.35
+4445   39.1     93.7     92.3     0.42
+1809   88.9    210.9    214.1     0.42
+3950   35.8     84.3    118.3     0.42
+1015   43.3    100.6     94.6     0.43
+2217   52.1    114.9    162.5     0.45
+
+$ python scripts/analyze_host.py results/kuzu_dblp_cyc.csv --base KNO
+results/kuzu_dblp_cyc.csv: 1000 queries with all configs (0 missing a config: crash); status counts:
+status  error    ok  timeout
+method                      
+KNO         3  2589      134
+KR2        16  2636      106
+KSM        14  2599      121
+count mismatches vs KNO : {'KR2': 0, 'KSM': 0}
+baseline KNO: 863 evaluated (137 baseline timeouts excluded)
+noise floor (KNO rep vs rep): <0.8 4.9%  <0.5 0.1%  >1.25 5.4%  >2 0.0%
+config     <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new
+KNO        0.0%   0.0%   0.0%   0.0%    1.000   1.00   1.00   1.00    793.9  137    0/0   
+KR2        1.3%   0.0%  81.9%  72.2%    4.550   0.94   4.84  22.41    397.0  122   15/0   
+KSM        3.1%   0.1%  61.2%  42.4%    2.303   0.87   1.62  14.74    642.9  135    9/7   
+by baseline time (geomean, share < 0.8x):
+      0-   20 ms n=  20  KR2: 0.90 (25%)  KSM: 1.06 (5%)
+     20-  100 ms n=  61  KR2: 1.37 (8%)  KSM: 1.44 (11%)
+    100- 1000 ms n= 606  KR2: 6.22 (0%)  KSM: 3.01 (1%)
+   1000-  inf ms n= 176  KR2: 2.83 (0%)  KSM: 1.18 (6%)
+worst KR2 queries (speedup):
+       KNO    KR2   KSM  speedup
+qid                             
+947    8.1   12.7   8.1     0.64
+721   26.3   40.6  18.5     0.65
+377   17.0   25.4  18.6     0.67
+826   23.8   35.0  28.4     0.68
+9     11.2   16.3  11.4     0.69
+284  100.7  140.5  52.2     0.72
+489   20.7   27.8  19.6     0.74
+288   33.9   45.5  32.2     0.74
+
+$ python scripts/analyze_host.py results/kuzu_dblp_ksx.csv --base KNO
+results/kuzu_dblp_ksx.csv: 4994 queries with all configs (1 missing a config: crash); status counts:
+status  error     ok  timeout
+method                       
+KNO         2  14015      324
+KSX        11  14075      294
+count mismatches vs KNO : {'KSX': 0}
+baseline KNO: 4668 evaluated (326 baseline timeouts excluded)
+noise floor (KNO rep vs rep): <0.8 10.9%  <0.5 0.5%  >1.25 10.9%  >2 0.4%
+config     <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new
+KNO        0.0%   0.0%   0.0%   0.0%    1.000   1.00   1.00   1.00   1206.8  326    0/0   
+KSX       15.7%   4.8%  28.7%  18.2%    1.240   0.51   1.03   5.79   1317.9  304   47/25  
+by baseline time (geomean, share < 0.8x):
+      0-   20 ms n=1186  KSX: 0.97 (16%)
+     20-  100 ms n=1617  KSX: 1.56 (17%)
+    100- 1000 ms n=1644  KSX: 1.22 (13%)
+   1000-  inf ms n= 221  KSX: 0.94 (24%)
+worst KSX queries (speedup):
+         KNO      KSX  speedup
+qid                           
+2928   216.4  10000.0     0.02
+2933   347.4  10000.0     0.03
+1957  1018.3  10000.0     0.10
+4057    35.2    221.5     0.16
+1518    55.2    302.4     0.18
+4658    57.1    298.7     0.19
+4218    62.0    322.4     0.19
+3422    20.1     94.0     0.21
+
+$ python scripts/analyze_host.py results/kuzu_lsqbp_sf1_intersect.csv --base KNO --timeout 60
+results/kuzu_lsqbp_sf1_intersect.csv: 160 queries with all configs (0 missing a config: crash); status counts:
+status   ok
+method     
+KNO     480
+KR2     480
+KSM     480
+count mismatches vs KNO : {'KR2': 0, 'KSM': 0}
+baseline KNO: 160 evaluated (0 baseline timeouts excluded)
+noise floor (KNO rep vs rep): <0.8 5.0%  <0.5 0.0%  >1.25 3.8%  >2 0.0%
+config     <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new
+KNO        0.0%   0.0%   0.0%   0.0%    1.000   1.00   1.00   1.00    599.1    0    0/0   
+KR2        1.9%   0.0%  25.6%  25.0%    1.833   0.87   1.03  17.70    118.1    0    0/0   
+KSM        0.0%   0.0%  28.1%   9.4%    1.250   0.92   1.06   2.39    592.6    0    0/0   
+by baseline time (geomean, share < 0.8x):
+      0-   20 ms n=  20  KR2: 0.96 (0%)  KSM: 1.51 (0%)
+     20-  100 ms n=   1  KR2: 0.85 (0%)  KSM: 0.95 (0%)
+    100- 1000 ms n= 103  KR2: 1.25 (3%)  KSM: 1.30 (0%)
+   1000-  inf ms n=  36  KR2: 8.06 (0%)  KSM: 1.01 (0%)
+worst KR2 queries (speedup):
+       KNO    KR2    KSM  speedup
+qid                              
+212  534.4  740.3  473.1     0.72
+210  565.7  735.0  617.4     0.77
+205  516.6  655.9  552.8     0.79
+291   12.0   14.6    4.5     0.82
+217  620.2  750.9  614.0     0.83
+257   87.5  103.5   92.3     0.85
+54   451.0  525.5  465.0     0.86
+283   11.2   12.9    4.7     0.87
+
+$ python scripts/analyze_host.py results/pg19_rptg_dblp300.csv --base PGNO
+results/pg19_rptg_dblp300.csv: 300 queries with all configs (0 missing a config: crash); status counts:
+status   ok  timeout
+method              
+PG1     729       57
+PGNO    768       44
+PGR     774       42
+PGR1    729       57
+count mismatches vs PGNO : {'PG1': 0, 'PGR': 0, 'PGR1': 0}
+baseline PGNO: 256 evaluated (44 baseline timeouts excluded)
+noise floor (PGNO rep vs rep): <0.8 8.2%  <0.5 0.0%  >1.25 7.8%  >2 2.3%
+config     <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new
+PG1       30.5%  13.7%  28.1%   7.4%    0.946   0.32   1.01   2.34    258.5   57    1/14  
+PGNO       0.0%   0.0%   0.0%   0.0%    1.000   1.00   1.00   1.00    146.6   44    0/0   
+PGR        9.4%   0.8%  13.3%   1.2%    1.031   0.64   1.00   1.57    143.0   42    2/0   
+PGR1      32.8%  12.5%  23.4%   7.0%    0.941   0.33   1.00   2.23    256.4   57    1/14  
+by baseline time (geomean, share < 0.8x):
+      0-   20 ms n= 119  PG1: 1.18 (14%)  PGR: 1.00 (17%)  PGR1: 1.12 (17%)
+     20-  100 ms n=  47  PG1: 1.12 (17%)  PGR: 1.01 (6%)  PGR1: 1.13 (19%)
+    100- 1000 ms n=  54  PG1: 0.67 (54%)  PGR: 1.14 (2%)  PGR1: 0.74 (57%)
+   1000-  inf ms n=  36  PG1: 0.61 (67%)  PGR: 1.02 (0%)  PGR1: 0.61 (67%)
+worst PG1 queries (speedup):
+         PG1    PGNO     PGR    PGR1  speedup
+qid                                          
+2090  2225.1   466.5   460.7  2247.7     0.21
+2634   682.7   167.9   131.3   494.6     0.25
+2934  1184.9   295.0   286.4  1142.3     0.25
+387   8860.4  2268.9  2175.1  8256.6     0.26
+2071  1995.5   514.7   464.3  1950.8     0.26
+3136  1063.6   304.3   251.5   854.1     0.29
+1048   668.7   191.8   192.1   677.5     0.29
+719   1853.7   534.1   440.5  1657.8     0.29
+
+$ python scripts/analyze_host.py results/duckdb_rptg_dblp300.csv --base dk0
+results/duckdb_rptg_dblp300.csv: 300 queries with all configs (0 missing a config: crash); status counts:
+status    ok  timeout
+method               
+dk0      859       15
+dkr      859       15
+vanilla  859       15
+count mismatches vs dk0 : {'dkr': 0, 'vanilla': 0}
+baseline dk0: 284 evaluated (16 baseline timeouts excluded)
+noise floor (dk0 rep vs rep): <0.8 1.1%  <0.5 0.0%  >1.25 5.6%  >2 0.0%
+config     <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new
+dk0        0.0%   0.0%   0.0%   0.0%    1.000   1.00   1.00   1.00     78.0   16    0/0   
+dkr        3.5%   0.0%   1.8%   0.4%    0.996   0.83   1.00   1.13     75.9   16    0/0   
+vanilla    0.0%   0.0%   5.3%   0.0%    1.056   0.89   1.06   1.26     73.0   16    0/0   
+by baseline time (geomean, share < 0.8x):
+      0-   20 ms n= 143  dkr: 0.97 (5%)  vanilla: 1.04 (0%)
+     20-  100 ms n=  77  dkr: 1.01 (4%)  vanilla: 1.10 (0%)
+    100- 1000 ms n=  38  dkr: 1.05 (0%)  vanilla: 1.05 (0%)
+   1000-  inf ms n=  26  dkr: 1.04 (0%)  vanilla: 1.06 (0%)
+worst dkr queries (speedup):
+       dk0    dkr  vanilla  speedup
+qid                                
+1567  17.0   23.0     16.0     0.74
+4877   6.0    8.0      7.0     0.75
+1849   6.0    8.0      6.0     0.75
+4060  18.0   24.0     22.0     0.75
+2533   9.0   12.0     10.0     0.75
+3931  88.0  116.0     85.0     0.76
+2303  10.0   13.0     10.0     0.77
+3508   7.0    9.0      7.0     0.78
+
+$ python scripts/analyze_host.py results/pg19_dblp_cyc.csv --base PGNO
+results/pg19_dblp_cyc.csv: 1000 queries with all configs (0 missing a config: crash); status counts:
+status    ok  timeout
+method               
+PGNO    2440      187
+PGR     2458      181
+count mismatches vs PGNO : {'PGR': 0}
+baseline PGNO: 813 evaluated (187 baseline timeouts excluded)
+noise floor (PGNO rep vs rep): <0.8 1.7%  <0.5 0.0%  >1.25 3.7%  >2 0.0%
+config     <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new
+PGNO       0.0%   0.0%   0.0%   0.0%    1.000   1.00   1.00   1.00    675.2  187    0/0   
+PGR        0.9%   0.0%   8.1%   1.5%    1.049   0.92   1.00   1.39    627.0  181    8/2   
+by baseline time (geomean, share < 0.8x):
+      0-   20 ms n= 206  PGR: 1.01 (1%)
+     20-  100 ms n= 244  PGR: 1.04 (0%)
+    100- 1000 ms n= 217  PGR: 1.06 (0%)
+   1000-  inf ms n= 146  PGR: 1.10 (2%)
+worst PGR queries (speedup):
+       PGNO      PGR  speedup
+qid                          
+815  5777.1  10000.0     0.58
+233     1.9      2.8     0.68
+231  3972.8   5527.8     0.72
+706   183.6    248.6     0.74
+187     8.3     10.5     0.79
+253    99.2    125.6     0.79
+391  7989.8  10000.0     0.80
+583   168.2    203.1     0.83
+
+$ python scripts/analyze_host.py results/duckdb_dblp_cyc.csv --base dk0
+results/duckdb_dblp_cyc.csv: 1000 queries with all configs (0 missing a config: crash); status counts:
+status    ok  timeout
+method               
+dk0     2893       40
+dkr     2912       33
+count mismatches vs dk0 : {'dkr': 0}
+baseline dk0: 958 evaluated (42 baseline timeouts excluded)
+noise floor (dk0 rep vs rep): <0.8 0.5%  <0.5 0.0%  >1.25 1.8%  >2 0.0%
+config     <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new
+dk0        0.0%   0.0%   0.0%   0.0%    1.000   1.00   1.00   1.00    438.3   42    0/0   
+dkr        0.8%   0.0%  12.5%   8.5%    1.177   0.87   1.00   4.26    339.9   37    6/1   
+by baseline time (geomean, share < 0.8x):
+      0-   20 ms n= 261  dkr: 0.99 (1%)
+     20-  100 ms n= 401  dkr: 1.01 (1%)
+    100- 1000 ms n= 196  dkr: 1.71 (1%)
+   1000-  inf ms n= 100  dkr: 1.63 (1%)
+worst dkr queries (speedup):
+        dk0     dkr  speedup
+qid                         
+230    63.0    98.0     0.64
+981    50.0    72.0     0.69
+831    77.0   106.0     0.73
+259     8.0    11.0     0.73
+524   259.0   352.0     0.74
+372     9.0    12.0     0.75
+923    11.0    14.0     0.79
+236  3172.0  3970.0     0.80

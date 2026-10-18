@@ -1,0 +1,619 @@
+diff --git a/src/include/common/mask.h b/src/include/common/mask.h
+index dc181c3..94440ea 100644
+--- a/src/include/common/mask.h
++++ b/src/include/common/mask.h
+@@ -27,11 +27,15 @@ public:
+     offset_t getMaxOffset() const { return maxOffset; }
+ 
+     bool isEnabled() const { return enabled; }
++    // RPT-G: set once a semi masker has written this mask; an intersecting masker ANDs into it.
++    bool isWritten() const { return written; }
++    void setWritten() { written = true; }
+     void enable() { enabled = true; }
+ 
+ private:
+     offset_t maxOffset;
+     bool enabled;
++    bool written = false;
+ };
+ 
+ struct SemiMaskUtil {
+diff --git a/src/include/main/client_config.h b/src/include/main/client_config.h
+index f249035..0b2be4d 100644
+--- a/src/include/main/client_config.h
++++ b/src/include/main/client_config.h
+@@ -32,6 +32,9 @@ struct ClientConfig {
+     std::string fileSearchPath;
+     // If using semi mask in join.
+     bool enableSemiMask = ClientConfigDefault::ENABLE_SEMI_MASK;
++    // RPT-G transfer phase. 0: off (Kuzu's own hash-join SIP applies). 1: multi-hop transfers as
++    // side pipelines with usefulness pruning (replaces the hash-join SIP).
++    int64_t rptgMode = 0;
+     // If using zone map in scan.
+     bool enableZoneMap = ClientConfigDefault::ENABLE_ZONE_MAP;
+     // Number of threads for execution.
+diff --git a/src/include/main/settings.h b/src/include/main/settings.h
+index d55e27f..0fc5771 100644
+--- a/src/include/main/settings.h
++++ b/src/include/main/settings.h
+@@ -93,6 +93,18 @@ struct EnableSemiMaskSetting {
+     }
+ };
+ 
++struct RPTGModeSetting {
++    static constexpr auto name = "rptg_mode";
++    static constexpr auto inputType = common::LogicalTypeID::INT64;
++    static void setContext(ClientContext* context, const common::Value& parameter) {
++        parameter.validateType(inputType);
++        context->getClientConfigUnsafe()->rptgMode = parameter.getValue<int64_t>();
++    }
++    static common::Value getSetting(const ClientContext* context) {
++        return common::Value(context->getClientConfig()->rptgMode);
++    }
++};
++
+ struct DisableMapKeyCheck {
+     static constexpr auto name = "disable_map_key_check";
+     static constexpr auto inputType = common::LogicalTypeID::BOOL;
+diff --git a/src/include/optimizer/rptg_transfer_optimizer.h b/src/include/optimizer/rptg_transfer_optimizer.h
+new file mode 100644
+index 0000000..c5d27e7
+--- /dev/null
++++ b/src/include/optimizer/rptg_transfer_optimizer.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include "planner/operator/logical_plan.h"
++
++namespace kuzu {
++namespace main {
++class ClientContext;
++}
++namespace optimizer {
++
++// RPT-G: robust predicate transfer for graph pattern queries.
++//
++// Recovers the (tree-shaped) pattern from the logical plan, builds the transfer sequence of
++// Algorithm 1' (forward pass leaves -> root, backward pass root -> leaves), prunes transfers whose
++// information is never consumed, and materializes every remaining transfer x -> y as a side
++// pipeline
++//     SCAN_NODE_TABLE(x) [FILTER sigma_x] -> EXTEND(x -> y) -> SEMI_MASKER(y, intersect) -> DUMMY_SINK
++// whose masks land on the SCAN_NODE_TABLE(y) operators of the main plan and of later transfers.
++// Unlike the accumulate-based hash-join SIP, the main plan is not materialized anywhere.
++class RPTGTransferOptimizer {
++public:
++    explicit RPTGTransferOptimizer(main::ClientContext* context) : context{context} {}
++
++    void rewrite(planner::LogicalPlan* plan);
++
++private:
++    main::ClientContext* context;
++};
++
++} // namespace optimizer
++} // namespace kuzu
+diff --git a/src/include/planner/operator/logical_plan.h b/src/include/planner/operator/logical_plan.h
+index fc4c120..d00369a 100644
+--- a/src/include/planner/operator/logical_plan.h
++++ b/src/include/planner/operator/logical_plan.h
+@@ -13,7 +13,8 @@ class KUZU_API LogicalPlan {
+ 
+ public:
+     LogicalPlan() : cost{0} {}
+-    LogicalPlan(const LogicalPlan& other) : lastOperator{other.lastOperator}, cost{other.cost} {}
++    LogicalPlan(const LogicalPlan& other)
++        : rptgTransfers{other.rptgTransfers}, lastOperator{other.lastOperator}, cost{other.cost} {}
+     EXPLICIT_COPY_DEFAULT_MOVE(LogicalPlan);
+ 
+     void setLastOperator(std::shared_ptr<LogicalOperator> op) { lastOperator = std::move(op); }
+@@ -38,6 +39,10 @@ public:
+     std::string toString() const { return lastOperator->toString(); }
+ 
+     bool isProfile() const;
++
++    // RPT-G: transfer sub-plans (each rooted at a LogicalDummySink), in execution order. They run
++    // to completion, one after the other, before any pipeline of the main plan.
++    std::vector<std::shared_ptr<LogicalOperator>> rptgTransfers;
+     bool hasUpdate() const;
+ 
+ private:
+diff --git a/src/include/planner/operator/sip/logical_semi_masker.h b/src/include/planner/operator/sip/logical_semi_masker.h
+index 2cc53b5..f40c39c 100644
+--- a/src/include/planner/operator/sip/logical_semi_masker.h
++++ b/src/include/planner/operator/sip/logical_semi_masker.h
+@@ -87,6 +87,9 @@ public:
+     std::vector<common::table_id_t> getNodeTableIDs() const { return nodeTableIDs; }
+ 
+     void addTarget(const LogicalOperator* op) { targetOps.push_back(op); }
++    // RPT-G: B_y <- B_y AND N(B_x) instead of overwriting the target mask.
++    void setIntersect(bool intersect_) { intersect = intersect_; }
++    bool isIntersect() const { return intersect; }
+     std::vector<const LogicalOperator*> getTargetOperators() const { return targetOps; }
+ 
+     std::unique_ptr<LogicalOperator> copy() override {
+@@ -111,6 +114,7 @@ private:
+     std::vector<common::table_id_t> nodeTableIDs;
+     // Operators accepting semi masker
+     std::vector<const LogicalOperator*> targetOps;
++    bool intersect = false;
+ };
+ 
+ } // namespace planner
+diff --git a/src/include/processor/operator/semi_masker.h b/src/include/processor/operator/semi_masker.h
+index f0ee396..94e8785 100644
+--- a/src/include/processor/operator/semi_masker.h
++++ b/src/include/processor/operator/semi_masker.h
+@@ -25,8 +25,9 @@ struct SemiMaskerLocalState {
+ class SemiMaskerSharedState {
+ public:
+     explicit SemiMaskerSharedState(
+-        common::table_id_map_t<std::vector<common::SemiMask*>> masksPerTable)
+-        : masksPerTable{std::move(masksPerTable)} {}
++        common::table_id_map_t<std::vector<common::SemiMask*>> masksPerTable,
++        bool intersect = false)
++        : masksPerTable{std::move(masksPerTable)}, intersect{intersect} {}
+ 
+     SemiMaskerLocalState* appendLocalState();
+ 
+@@ -36,6 +37,7 @@ private:
+     common::table_id_map_t<std::vector<common::SemiMask*>> masksPerTable;
+     std::vector<std::shared_ptr<SemiMaskerLocalState>> localInfos;
+     std::mutex mtx;
++    bool intersect;
+ };
+ 
+ struct SemiMaskerPrintInfo final : OPPrintInfo {
+diff --git a/src/main/db_config.cpp b/src/main/db_config.cpp
+index 5bad44e..974024f 100644
+--- a/src/main/db_config.cpp
++++ b/src/main/db_config.cpp
+@@ -22,7 +22,8 @@ static ConfigurationOption options[] = { // NOLINT(cert-err58-cpp):
+     GET_CONFIGURATION(RecursivePatternFactorSetting), GET_CONFIGURATION(EnableMVCCSetting),
+     GET_CONFIGURATION(CheckpointThresholdSetting), GET_CONFIGURATION(AutoCheckpointSetting),
+     GET_CONFIGURATION(ForceCheckpointClosingDBSetting), GET_CONFIGURATION(SpillToDiskSetting),
+-    GET_CONFIGURATION(EnableOptimizerSetting), GET_CONFIGURATION(EnableInternalCatalogSetting)};
++    GET_CONFIGURATION(EnableOptimizerSetting), GET_CONFIGURATION(EnableInternalCatalogSetting),
++    GET_CONFIGURATION(RPTGModeSetting)};
+ 
+ DBConfig::DBConfig(const SystemConfig& systemConfig)
+     : bufferPoolSize{systemConfig.bufferPoolSize}, maxNumThreads{systemConfig.maxNumThreads},
+diff --git a/src/optimizer/CMakeLists.txt b/src/optimizer/CMakeLists.txt
+index 0caef72..4dc64d3 100644
+--- a/src/optimizer/CMakeLists.txt
++++ b/src/optimizer/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ add_library(kuzu_optimizer
+         OBJECT
+         acc_hash_join_optimizer.cpp
++        rptg_transfer_optimizer.cpp
+         agg_key_dependency_optimizer.cpp
+         cardinality_updater.cpp
+         correlated_subquery_unnest_solver.cpp
+diff --git a/src/optimizer/optimizer.cpp b/src/optimizer/optimizer.cpp
+index 6ae3977..a892baf 100644
+--- a/src/optimizer/optimizer.cpp
++++ b/src/optimizer/optimizer.cpp
+@@ -11,6 +11,7 @@
+ #include "optimizer/projection_push_down_optimizer.h"
+ #include "optimizer/remove_factorization_rewriter.h"
+ #include "optimizer/remove_unnecessary_join_optimizer.h"
++#include "optimizer/rptg_transfer_optimizer.h"
+ #include "optimizer/schema_populator.h"
+ #include "optimizer/top_k_optimizer.h"
+ #include "planner/operator/logical_explain.h"
+@@ -41,7 +42,11 @@ void Optimizer::optimize(planner::LogicalPlan* plan, main::ClientContext* contex
+         auto limitPushDownOptimizer = LimitPushDownOptimizer();
+         limitPushDownOptimizer.rewrite(plan);
+ 
+-        if (context->getClientConfig()->enableSemiMask) {
++        if (context->getClientConfig()->rptgMode > 0) {
++            // RPT-G replaces the accumulate-based hash-join SIP by multi-hop side-pipeline transfers.
++            auto rptgTransferOptimizer = RPTGTransferOptimizer(context);
++            rptgTransferOptimizer.rewrite(plan);
++        } else if (context->getClientConfig()->enableSemiMask) {
+             // HashJoinSIPOptimizer should be applied after optimizers that manipulate hash join.
+             auto hashJoinSIPOptimizer = HashJoinSIPOptimizer();
+             hashJoinSIPOptimizer.rewrite(plan);
+diff --git a/src/optimizer/rptg_transfer_optimizer.cpp b/src/optimizer/rptg_transfer_optimizer.cpp
+new file mode 100644
+index 0000000..5f6f9ce
+--- /dev/null
++++ b/src/optimizer/rptg_transfer_optimizer.cpp
+@@ -0,0 +1,323 @@
++#include "optimizer/rptg_transfer_optimizer.h"
++
++#include <algorithm>
++#include <functional>
++#include <unordered_map>
++
++#include "binder/expression/node_expression.h"
++#include "binder/expression/rel_expression.h"
++#include "main/client_context.h"
++#include "optimizer/factorization_rewriter.h"
++#include "planner/operator/extend/logical_extend.h"
++#include "planner/operator/logical_dummy_sink.h"
++#include "planner/operator/logical_filter.h"
++#include "planner/operator/logical_hash_join.h"
++#include "planner/operator/scan/logical_scan_node_table.h"
++#include "planner/operator/sip/logical_semi_masker.h"
++
++using namespace kuzu::binder;
++using namespace kuzu::common;
++using namespace kuzu::planner;
++
++namespace kuzu {
++namespace optimizer {
++
++namespace {
++
++struct PatternVertex {
++    std::shared_ptr<NodeExpression> node;
++    // Topmost operator of the [FILTER ... FILTER -> SCAN_NODE_TABLE] chain that evaluates sigma_x
++    // in the main plan; nullptr if the vertex carries no predicate.
++    LogicalOperator* predicateChain = nullptr;
++    // SCAN_NODE_TABLE operators that consume the candidate set of this vertex.
++    std::vector<LogicalOperator*> mainScans;
++    std::vector<std::pair<uint32_t, LogicalOperator*>> transferScans; // (transfer idx, scan)
++    uint32_t sources = 0;
++    cardinality_t estimatedCardinality = 0;
++};
++
++struct PatternEdge {
++    uint32_t a, b; // vertex indices; the rel goes from its src node to its dst node
++    std::shared_ptr<RelExpression> rel;
++};
++
++struct Transfer {
++    uint32_t x, y, edgeIdx;
++};
++
++struct Pattern {
++    std::vector<PatternVertex> vertices;
++    std::vector<PatternEdge> edges;
++    std::unordered_map<std::string, uint32_t> vertexIdx;
++    bool supported = true;
++
++    uint32_t getVertex(const std::shared_ptr<NodeExpression>& node) {
++        auto name = node->getUniqueName();
++        if (!vertexIdx.contains(name)) {
++            vertexIdx.insert({name, static_cast<uint32_t>(vertices.size())});
++            vertices.push_back(PatternVertex{node});
++        }
++        return vertexIdx.at(name);
++    }
++};
++
++bool isTransparent(LogicalOperatorType type) {
++    switch (type) {
++    case LogicalOperatorType::SCAN_NODE_TABLE:
++    case LogicalOperatorType::FILTER:
++    case LogicalOperatorType::EXTEND:
++    case LogicalOperatorType::HASH_JOIN:
++    case LogicalOperatorType::FLATTEN:
++    case LogicalOperatorType::PROJECTION:
++    case LogicalOperatorType::AGGREGATE:
++    case LogicalOperatorType::LIMIT:
++    case LogicalOperatorType::ORDER_BY:
++    case LogicalOperatorType::MULTIPLICITY_REDUCER:
++    case LogicalOperatorType::EXPLAIN:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// Walks the main plan; parent is the operator directly above op.
++void collect(LogicalOperator* op, LogicalOperator* parent, LogicalOperator* topFilter,
++    Pattern& pattern) {
++    if (!isTransparent(op->getOperatorType())) {
++        pattern.supported = false;
++        return;
++    }
++    switch (op->getOperatorType()) {
++    case LogicalOperatorType::HASH_JOIN: {
++        if (op->constCast<LogicalHashJoin>().getJoinType() != JoinType::INNER) {
++            pattern.supported = false;
++            return;
++        }
++    } break;
++    case LogicalOperatorType::EXTEND: {
++        auto& extend = op->constCast<LogicalExtend>();
++        auto rel = extend.getRel();
++        if (rel->isRecursive() || rel->getDirectionType() == RelDirectionType::BOTH) {
++            pattern.supported = false;
++            return;
++        }
++        auto a = pattern.getVertex(rel->getSrcNode());
++        auto b = pattern.getVertex(rel->getDstNode());
++        pattern.edges.push_back(PatternEdge{a, b, rel});
++    } break;
++    case LogicalOperatorType::SCAN_NODE_TABLE: {
++        auto& scan = op->constCast<LogicalScanNodeTable>();
++        if (scan.getScanType() != LogicalScanNodeTableType::SCAN) {
++            break;
++        }
++        auto name = scan.getNodeID()->getUniqueName();
++        for (auto& v : pattern.vertices) {
++            if (v.node->getInternalID()->getUniqueName() == name) {
++                v.mainScans.push_back(op);
++                if (topFilter != nullptr && v.predicateChain == nullptr) {
++                    v.predicateChain = topFilter;
++                    v.estimatedCardinality = topFilter->getCardinality();
++                }
++            }
++        }
++    } break;
++    default:
++        break;
++    }
++    (void)parent;
++    for (auto i = 0u; i < op->getNumChildren(); ++i) {
++        auto child = op->getChild(i).get();
++        LogicalOperator* nextTopFilter = nullptr;
++        if (child->getOperatorType() == LogicalOperatorType::FILTER) {
++            // keep the topmost filter of a consecutive filter chain
++            nextTopFilter = op->getOperatorType() == LogicalOperatorType::FILTER && topFilter ?
++                                topFilter :
++                                child;
++        } else if (child->getOperatorType() == LogicalOperatorType::SCAN_NODE_TABLE &&
++                   op->getOperatorType() == LogicalOperatorType::FILTER) {
++            nextTopFilter = topFilter;
++        }
++        collect(child, op, nextTopFilter, pattern);
++    }
++}
++
++bool isTree(const Pattern& pattern) {
++    auto n = pattern.vertices.size();
++    if (n < 2 || pattern.edges.size() != n - 1) {
++        return false;
++    }
++    std::vector<uint32_t> parent(n);
++    for (auto i = 0u; i < n; ++i) {
++        parent[i] = i;
++    }
++    std::function<uint32_t(uint32_t)> find = [&](uint32_t v) {
++        return parent[v] == v ? v : parent[v] = find(parent[v]);
++    };
++    for (auto& e : pattern.edges) {
++        auto ra = find(e.a), rb = find(e.b);
++        if (ra == rb) {
++            return false;
++        }
++        parent[ra] = rb;
++    }
++    return true;
++}
++
++// Algorithm 1': root = a predicate-less vertex if any (ties: first), children ordered by ascending
++// estimated candidate-set size; forward = post-order (child -> parent), backward = pre-order.
++std::vector<Transfer> buildSequence(const Pattern& pattern) {
++    auto n = static_cast<uint32_t>(pattern.vertices.size());
++    uint32_t root = 0;
++    for (auto v = 0u; v < n; ++v) {
++        if (pattern.vertices[v].predicateChain == nullptr) {
++            root = v;
++            break;
++        }
++    }
++    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> adj(n); // (neighbour, edge idx)
++    for (auto i = 0u; i < pattern.edges.size(); ++i) {
++        adj[pattern.edges[i].a].emplace_back(pattern.edges[i].b, i);
++        adj[pattern.edges[i].b].emplace_back(pattern.edges[i].a, i);
++    }
++    std::vector<Transfer> forward, backward;
++    std::function<void(uint32_t, uint32_t)> visit = [&](uint32_t v, uint32_t parentVertex) {
++        auto children = adj[v];
++        std::stable_sort(children.begin(), children.end(), [&](auto& l, auto& r) {
++            return pattern.vertices[l.first].estimatedCardinality <
++                   pattern.vertices[r.first].estimatedCardinality;
++        });
++        for (auto& [c, e] : children) {
++            if (c == parentVertex) {
++                continue;
++            }
++            backward.push_back(Transfer{v, c, e});
++            visit(c, v);
++            forward.push_back(Transfer{c, v, e});
++        }
++    };
++    visit(root, UINT32_MAX);
++    // backward was emitted in pre-order already; forward in post-order.
++    std::vector<Transfer> sequence = forward;
++    sequence.insert(sequence.end(), backward.begin(), backward.end());
++    return sequence;
++}
++
++// Source skip (Lemma P5) simulated at plan time + consumption: a transfer x -> y is kept iff it
++// carries information y does not have yet and that information is consumed — by a scan of y in the
++// main plan, or by a later kept transfer that reads y.
++std::vector<bool> pruneUseless(const Pattern& pattern, const std::vector<Transfer>& sequence) {
++    std::vector<uint32_t> sources(pattern.vertices.size(), 0);
++    for (auto v = 0u; v < pattern.vertices.size(); ++v) {
++        sources[v] = pattern.vertices[v].predicateChain != nullptr ? (1u << v) : 0u;
++    }
++    std::vector<bool> effective(sequence.size(), false), useful(sequence.size(), false);
++    for (auto i = 0u; i < sequence.size(); ++i) {
++        effective[i] = (sources[sequence[i].x] & ~sources[sequence[i].y]) != 0;
++        if (effective[i]) {
++            sources[sequence[i].y] |= sources[sequence[i].x];
++        }
++    }
++    for (auto i = static_cast<int64_t>(sequence.size()) - 1; i >= 0; --i) {
++        if (!effective[i]) {
++            continue;
++        }
++        bool consumed = !pattern.vertices[sequence[i].y].mainScans.empty();
++        for (auto j = static_cast<uint64_t>(i) + 1; j < sequence.size() && !consumed; ++j) {
++            consumed = useful[j] && sequence[j].x == sequence[i].y;
++        }
++        useful[i] = consumed;
++    }
++    return useful;
++}
++
++LogicalOperator* findScan(LogicalOperator* op) {
++    while (op->getOperatorType() != LogicalOperatorType::SCAN_NODE_TABLE) {
++        op = op->getChild(0).get();
++    }
++    return op;
++}
++
++} // namespace
++
++void RPTGTransferOptimizer::rewrite(LogicalPlan* plan) {
++    Pattern pattern;
++    // Two passes: edges first so that scans can be matched to pattern vertices.
++    std::function<void(LogicalOperator*)> collectEdges = [&](LogicalOperator* op) {
++        if (op->getOperatorType() == LogicalOperatorType::EXTEND) {
++            auto rel = op->constCast<LogicalExtend>().getRel();
++            if (!rel->isRecursive()) {
++                pattern.getVertex(rel->getSrcNode());
++                pattern.getVertex(rel->getDstNode());
++            }
++        }
++        for (auto i = 0u; i < op->getNumChildren(); ++i) {
++            collectEdges(op->getChild(i).get());
++        }
++    };
++    collectEdges(plan->getLastOperator().get());
++    collect(plan->getLastOperator().get(), nullptr, nullptr, pattern);
++    if (!pattern.supported || !isTree(pattern) || pattern.vertices.size() > 30) {
++        return;
++    }
++    bool hasPredicate = false;
++    for (auto& v : pattern.vertices) {
++        hasPredicate |= v.predicateChain != nullptr;
++    }
++    if (!hasPredicate) {
++        return;
++    }
++    auto sequence = buildSequence(pattern);
++    auto useful = pruneUseless(pattern, sequence);
++
++    // Phase 1: source sub-plans (their scans are consumers of earlier transfers into x).
++    std::vector<std::shared_ptr<LogicalOperator>> sourcePlans(sequence.size());
++    for (auto i = 0u; i < sequence.size(); ++i) {
++        if (!useful[i]) {
++            continue;
++        }
++        auto& x = pattern.vertices[sequence[i].x];
++        std::shared_ptr<LogicalOperator> source;
++        if (x.predicateChain != nullptr) {
++            source = x.predicateChain->copy();
++        } else {
++            source = std::make_shared<LogicalScanNodeTable>(x.node->getInternalID(),
++                x.node->getTableIDs(), expression_vector{});
++        }
++        x.transferScans.emplace_back(i, findScan(source.get()));
++        sourcePlans[i] = std::move(source);
++    }
++    // Phase 2: extend + intersecting semi masker + sink.
++    for (auto i = 0u; i < sequence.size(); ++i) {
++        if (!useful[i]) {
++            continue;
++        }
++        auto& t = sequence[i];
++        auto& x = pattern.vertices[t.x];
++        auto& y = pattern.vertices[t.y];
++        auto& edge = pattern.edges[t.edgeIdx];
++        bool extendFromSource = edge.rel->getSrcNodeName() == x.node->getUniqueName();
++        auto direction = extendFromSource ? ExtendDirection::FWD : ExtendDirection::BWD;
++        auto extend = std::make_shared<LogicalExtend>(x.node, y.node, edge.rel, direction,
++            extendFromSource, expression_vector{}, sourcePlans[i]);
++        auto masker = std::make_shared<LogicalSemiMasker>(SemiMaskKeyType::NODE,
++            SemiMaskTargetType::SCAN_NODE, y.node->getInternalID(), y.node->getTableIDs(), extend);
++        masker->setIntersect(true);
++        for (auto scan : y.mainScans) {
++            masker->addTarget(scan);
++        }
++        for (auto& [idx, scan] : y.transferScans) {
++            if (idx > i) {
++                masker->addTarget(scan);
++            }
++        }
++        auto sink = std::make_shared<LogicalDummySink>(masker);
++        // Same schema/flatten logic as the main plan.
++        LogicalPlan subPlan;
++        subPlan.setLastOperator(sink);
++        FactorizationRewriter().rewrite(&subPlan);
++        plan->rptgTransfers.push_back(subPlan.getLastOperator());
++    }
++}
++
++} // namespace optimizer
++} // namespace kuzu
+diff --git a/src/processor/map/map_semi_masker.cpp b/src/processor/map/map_semi_masker.cpp
+index 0a5343b..594a96f 100644
+--- a/src/processor/map/map_semi_masker.cpp
++++ b/src/processor/map/map_semi_masker.cpp
+@@ -86,7 +86,8 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapSemiMasker(
+         }
+     }
+     auto keyPos = DataPos(inSchema->getExpressionPos(*semiMasker.getKey()));
+-    auto sharedState = std::make_shared<SemiMaskerSharedState>(std::move(masksPerTable));
++    auto sharedState = std::make_shared<SemiMaskerSharedState>(std::move(masksPerTable),
++        semiMasker.isIntersect());
+     auto printInfo = std::make_unique<SemiMaskerPrintInfo>(operatorNames);
+     switch (semiMasker.getKeyType()) {
+     case SemiMaskKeyType::NODE: {
+diff --git a/src/processor/map/plan_mapper.cpp b/src/processor/map/plan_mapper.cpp
+index 6f9fcf6..725913f 100644
+--- a/src/processor/map/plan_mapper.cpp
++++ b/src/processor/map/plan_mapper.cpp
+@@ -19,6 +19,21 @@ std::unique_ptr<PhysicalPlan> PlanMapper::mapLogicalPlanToPhysical(const Logical
+         root = createResultCollector(AccumulateType::REGULAR, expressionsToCollect,
+             logicalPlan->getSchema(), std::move(root));
+     }
++    const auto& transfers = logicalPlan->rptgTransfers;
++    if (!transfers.empty()) {
++        std::vector<std::unique_ptr<PhysicalOperator>> sinks(transfers.size());
++        // Reverse order: the scans a masker targets (main plan, later transfers) are mapped first.
++        for (auto i = static_cast<int64_t>(transfers.size()) - 1; i >= 0; --i) {
++            sinks[i] = mapOperator(transfers[i].get());
++        }
++        // The scheduler runs child tasks sequentially, right-most child first, so nesting
++        // T_{i-1} as the last child of T_i and the chain as the last child of the root gives the
++        // execution order T_1, ..., T_k, main plan.
++        for (auto i = 1u; i < sinks.size(); ++i) {
++            sinks[i]->addChild(std::move(sinks[i - 1]));
++        }
++        root->addChild(std::move(sinks.back()));
++    }
+     auto physicalPlan = std::make_unique<PhysicalPlan>(std::move(root));
+     if (logicalPlan->isProfile()) {
+         physicalPlan->lastOperator->ptrCast<Profile>()->setPhysicalPlan(physicalPlan.get());
+diff --git a/src/processor/operator/semi_masker.cpp b/src/processor/operator/semi_masker.cpp
+index d507d67..e105bdc 100644
+--- a/src/processor/operator/semi_masker.cpp
++++ b/src/processor/operator/semi_masker.cpp
+@@ -41,7 +41,13 @@ void SemiMaskerSharedState::mergeToGlobal() {
+                     const_cast<const roaring::Roaring64Map**>(masks.data())));
+             for (const auto& item : globalVector) {
+                 auto mask64 = static_cast<Roaring64BitmapSemiMask*>(item);
+-                mask64->roaring = mergedMask;
++                if (intersect && item->isWritten()) {
++                    mask64->roaring =
++                        std::make_shared<roaring::Roaring64Map>(*mask64->roaring & *mergedMask);
++                } else {
++                    mask64->roaring = mergedMask;
++                }
++                item->setWritten();
+             }
+         } else {
+             std::vector<roaring::Roaring*> masks;
+@@ -56,7 +62,13 @@ void SemiMaskerSharedState::mergeToGlobal() {
+                 masks.size(), const_cast<const roaring::Roaring**>(masks.data())));
+             for (const auto& item : globalVector) {
+                 auto mask32 = static_cast<Roaring32BitmapSemiMask*>(item);
+-                mask32->roaring = mergedMask;
++                if (intersect && item->isWritten()) {
++                    mask32->roaring =
++                        std::make_shared<roaring::Roaring>(*mask32->roaring & *mergedMask);
++                } else {
++                    mask32->roaring = mergedMask;
++                }
++                item->setWritten();
+             }
+         }
+     }

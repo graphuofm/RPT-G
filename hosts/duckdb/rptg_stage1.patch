@@ -1,0 +1,786 @@
+diff --git a/src/execution/physical_plan/plan_use_bf.cpp b/src/execution/physical_plan/plan_use_bf.cpp
+index 611ebc8..c98b4a2 100644
+--- a/src/execution/physical_plan/plan_use_bf.cpp
++++ b/src/execution/physical_plan/plan_use_bf.cpp
+@@ -10,14 +10,25 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalUseBF &op) {
+ 
+ 	auto &bf_plan = op.filter_plan;
+ 	size_t target_idx = std::numeric_limits<size_t>::max();
++	// The linker made the user's plan pointer identical to the creator's; match by identity first.
++	// Matching by apply bindings alone breaks when compaction merged two creators (RPT-G pruning can
++	// make a forward and a backward creator adjacent) that hold plans with the same apply column: the
++	// second user then moves an already-moved filter.
+ 	for (size_t i = 0; i < bf_creator->filter_plans.size(); i++) {
++		if (bf_creator->filter_plans[i].get() == bf_plan.get() && bf_creator->bf_to_create[i]) {
++			target_idx = i;
++			break;
++		}
++	}
++	for (size_t i = 0; i < bf_creator->filter_plans.size() && target_idx == std::numeric_limits<size_t>::max(); i++) {
+ 		auto &filter_plan = bf_creator->filter_plans[i];
+-		if (filter_plan->apply == bf_plan->apply) {
++		if (filter_plan->apply == bf_plan->apply && bf_creator->bf_to_create[i]) {
+ 			target_idx = i;
+-			break; // Found the target, exit loop
+ 		}
+ 	}
+-	D_ASSERT(target_idx != std::numeric_limits<size_t>::max());
++	if (target_idx == std::numeric_limits<size_t>::max()) {
++		throw InternalException("RPT-G: no filter to use for this UseBF operator");
++	}
+ 
+ 	auto &use_bf = Make<PhysicalUseBF>(plan.types, op.filter_plan, std::move(bf_creator->bf_to_create[target_idx]),
+ 	                                   bf_creator, op.estimated_cardinality, op.below_join);
+diff --git a/src/include/duckdb/optimizer/predicate_transfer/predicate_transfer_optimizer.hpp b/src/include/duckdb/optimizer/predicate_transfer/predicate_transfer_optimizer.hpp
+index 2d53ed5..26539c9 100644
+--- a/src/include/duckdb/optimizer/predicate_transfer/predicate_transfer_optimizer.hpp
++++ b/src/include/duckdb/optimizer/predicate_transfer/predicate_transfer_optimizer.hpp
+@@ -22,6 +22,8 @@ public:
+ 
+ private:
+ 	unique_ptr<LogicalOperator> InsertTransferOperators(unique_ptr<LogicalOperator> plan);
++	//! RPT-G: drop the filter plans whose materialization cost exceeds the work they remove (RPTG_MODE>0)
++	void RPTGPrune(LogicalOperator &root);
+ 
+ 	//! Create Bloom filter and use existing Bloom filter for the given scan or filter node
+ 	vector<pair<idx_t, shared_ptr<FilterPlan>>> CreateBloomFilterPlan(LogicalOperator &node, bool reverse = false);
+diff --git a/src/include/duckdb/optimizer/predicate_transfer/transfer_graph_manager.hpp b/src/include/duckdb/optimizer/predicate_transfer/transfer_graph_manager.hpp
+index 688cf9e..a98f8cf 100644
+--- a/src/include/duckdb/optimizer/predicate_transfer/transfer_graph_manager.hpp
++++ b/src/include/duckdb/optimizer/predicate_transfer/transfer_graph_manager.hpp
+@@ -75,6 +75,8 @@ using BindingParentMap = unordered_map<ColumnBinding, ColumnBinding, ColumnBindi
+ using BindingGroupMap = unordered_map<ColumnBinding, shared_ptr<JoinKeyTableGroup>, ColumnBindingHashFunc>;
+ 
+ class TransferGraphManager {
++	friend class PredicateTransferOptimizer;
++
+ public:
+ 	explicit TransferGraphManager(ClientContext &context) : context(context), table_operator_manager(context) {
+ 	}
+diff --git a/src/optimizer/predicate_transfer/CMakeLists.txt b/src/optimizer/predicate_transfer/CMakeLists.txt
+index 5970568..8572f47 100644
+--- a/src/optimizer/predicate_transfer/CMakeLists.txt
++++ b/src/optimizer/predicate_transfer/CMakeLists.txt
+@@ -2,7 +2,7 @@ add_subdirectory(bloom_filter)
+ 
+ add_library_unity(
+   duckdb_predicate_transfer OBJECT transfer_graph_manager.cpp dag.cpp
+-  predicate_transfer_optimizer.cpp table_operator_namager.cpp)
++  predicate_transfer_optimizer.cpp table_operator_namager.cpp rptg_planner.cpp)
+ 
+ set(ALL_OBJECT_FILES
+     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_predicate_transfer>
+diff --git a/src/optimizer/predicate_transfer/predicate_transfer_optimizer.cpp b/src/optimizer/predicate_transfer/predicate_transfer_optimizer.cpp
+index 74807eb..126acb8 100644
+--- a/src/optimizer/predicate_transfer/predicate_transfer_optimizer.cpp
++++ b/src/optimizer/predicate_transfer/predicate_transfer_optimizer.cpp
+@@ -39,6 +39,7 @@ unique_ptr<LogicalOperator> PredicateTransferOptimizer::Optimize(unique_ptr<Logi
+ 		}
+ 	}
+ 
++	RPTGPrune(*plan);
+ 	return InsertTransferOperators(std::move(plan));
+ }
+ 
+diff --git a/src/optimizer/predicate_transfer/rptg_planner.cpp b/src/optimizer/predicate_transfer/rptg_planner.cpp
+new file mode 100644
+index 0000000..7eebd69
+--- /dev/null
++++ b/src/optimizer/predicate_transfer/rptg_planner.cpp
+@@ -0,0 +1,696 @@
++// RPT-G decision layer on top of RPT+'s transfer plan.
++//
++// RPT+ decides *which* filters to build by table shape (ATP) and abandons a filter at run time only
++// when its source is not selective. On graph pattern queries — every pattern edge is a copy of the
++// same edge table — that builds and materializes filters the join above cannot profit from.
++// This layer recovers the pattern (join-key classes = pattern vertices, edge-table copies = pattern
++// edges), estimates the candidate sets from column min/max statistics (DuckDB estimates every range
++// predicate at 20%), simulates the transfer sequence in RPT+'s execution order, and keeps a filter
++// only if its materialization cost is below beta times the work it removes from the plan above.
++#include "duckdb/optimizer/predicate_transfer/predicate_transfer_optimizer.hpp"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <functional>
++
++#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
++#include "duckdb/planner/expression/bound_cast_expression.hpp"
++#include "duckdb/planner/expression/bound_columnref_expression.hpp"
++#include "duckdb/planner/expression/bound_comparison_expression.hpp"
++#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/filter/conjunction_filter.hpp"
++#include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
++#include "duckdb/planner/filter/optional_filter.hpp"
++#include "duckdb/planner/operator/logical_comparison_join.hpp"
++#include "duckdb/planner/operator/logical_create_bf.hpp"
++#include "duckdb/planner/operator/logical_filter.hpp"
++#include "duckdb/planner/operator/logical_get.hpp"
++#include "duckdb/planner/operator/logical_use_bf.hpp"
++#include "duckdb/storage/data_table.hpp"
++#include "duckdb/storage/statistics/numeric_stats.hpp"
++
++namespace duckdb {
++
++namespace {
++
++constexpr double HOST_DEFAULT_SELECTIVITY = 0.2;
++
++double EnvDouble(const char *name, double def) {
++	auto s = std::getenv(name);
++	return s ? std::atof(s) : def;
++}
++
++bool Debug() {
++	return std::getenv("RPTG_DEBUG") != nullptr;
++}
++
++double ValueAsDouble(const Value &v, bool &ok) {
++	ok = true;
++	switch (v.type().InternalType()) {
++	case PhysicalType::DOUBLE:
++		return v.GetValue<double>();
++	case PhysicalType::FLOAT:
++		return v.GetValue<float>();
++	case PhysicalType::INT64:
++	case PhysicalType::INT32:
++	case PhysicalType::INT16:
++	case PhysicalType::INT8:
++		return static_cast<double>(v.GetValue<int64_t>());
++	case PhysicalType::UINT64:
++	case PhysicalType::UINT32:
++	case PhysicalType::UINT16:
++	case PhysicalType::UINT8:
++		return static_cast<double>(v.GetValue<uint64_t>());
++	default:
++		ok = false;
++		return 0;
++	}
++}
++
++// Column min/max of a base table column (storage statistics), or nullopt.
++struct Range {
++	double min, max;
++	bool integral;
++};
++
++optional_idx TableColumnOf(LogicalGet &get, idx_t output_column) {
++	auto &ids = get.GetColumnIds();
++	if (output_column >= ids.size()) {
++		return optional_idx();
++	}
++	return optional_idx(ids[output_column].GetPrimaryIndex());
++}
++
++unique_ptr<Range> ColumnRange(ClientContext &context, LogicalGet &get, idx_t table_column) {
++	if (!get.function.statistics) {
++		return nullptr;
++	}
++	auto stats = get.function.statistics(context, get.bind_data.get(), table_column);
++	if (!stats || !NumericStats::HasMinMax(*stats)) {
++		return nullptr;
++	}
++	bool ok1, ok2;
++	auto lo = ValueAsDouble(NumericStats::Min(*stats), ok1);
++	auto hi = ValueAsDouble(NumericStats::Max(*stats), ok2);
++	if (!ok1 || !ok2) {
++		return nullptr;
++	}
++	auto integral = stats->GetType().IsIntegral();
++	return make_uniq<Range>(Range {lo, hi, integral});
++}
++
++double RangeSelectivity(ExpressionType cmp, double literal, const Range &r) {
++	double width = r.max - r.min;
++	if (cmp == ExpressionType::COMPARE_EQUAL) {
++		if (literal < r.min || literal > r.max) {
++			return 0.0;
++		}
++		return r.integral ? 1.0 / (width + 1.0) : 0.01;
++	}
++	if (width <= 0) {
++		return HOST_DEFAULT_SELECTIVITY;
++	}
++	double below = std::min(1.0, std::max(0.0, (literal - r.min) / width)); // P(value < literal)
++	switch (cmp) {
++	case ExpressionType::COMPARE_LESSTHAN:
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++		return below;
++	case ExpressionType::COMPARE_GREATERTHAN:
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++		return 1.0 - below;
++	default:
++		return HOST_DEFAULT_SELECTIVITY;
++	}
++}
++
++// A comparison leaf after stripping casts: DuckDB pushes `FLOAT col <op> DOUBLE literal` into the scan as
++// an ExpressionFilter `CAST(col AS DOUBLE) <op> literal` whenever the literal cannot be narrowed to FLOAT
++// (in the Q-GEN workloads: every selectivity below ~1e-4, i.e. exactly the predicates that matter).
++// Inside an ExpressionFilter the column is a BoundReferenceExpression (index 0); the table column is the
++// key under which the filter is stored, so only the comparison type and the literal are needed here.
++bool IsColumnLeaf(const Expression &e) {
++	auto cur = &e;
++	while (cur->type == ExpressionType::OPERATOR_CAST) {
++		cur = cur->Cast<BoundCastExpression>().child.get();
++	}
++	return cur->type == ExpressionType::BOUND_REF || cur->type == ExpressionType::BOUND_COLUMN_REF;
++}
++
++double ExpressionFilterSelectivity(ClientContext &context, LogicalGet &get, idx_t table_column, const Expression &e) {
++	switch (e.type) {
++	case ExpressionType::CONJUNCTION_AND: {
++		double sel = 1.0;
++		for (auto &child : e.Cast<BoundConjunctionExpression>().children) {
++			sel *= ExpressionFilterSelectivity(context, get, table_column, *child);
++		}
++		return sel;
++	}
++	case ExpressionType::CONJUNCTION_OR: {
++		double sel = 0.0;
++		for (auto &child : e.Cast<BoundConjunctionExpression>().children) {
++			sel += ExpressionFilterSelectivity(context, get, table_column, *child);
++		}
++		return std::min(1.0, sel);
++	}
++	case ExpressionType::COMPARE_EQUAL:
++	case ExpressionType::COMPARE_LESSTHAN:
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++	case ExpressionType::COMPARE_GREATERTHAN:
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
++		auto &cmp = e.Cast<BoundComparisonExpression>();
++		const BoundConstantExpression *lit = nullptr;
++		auto type = e.type;
++		if (IsColumnLeaf(*cmp.left) && cmp.right->type == ExpressionType::VALUE_CONSTANT) {
++			lit = &cmp.right->Cast<BoundConstantExpression>();
++		} else if (IsColumnLeaf(*cmp.right) && cmp.left->type == ExpressionType::VALUE_CONSTANT) {
++			lit = &cmp.left->Cast<BoundConstantExpression>();
++			type = FlipComparisonExpression(e.type);
++		}
++		if (!lit) {
++			return HOST_DEFAULT_SELECTIVITY;
++		}
++		bool ok;
++		double v = ValueAsDouble(lit->value, ok);
++		auto range = ColumnRange(context, get, table_column);
++		return ok && range ? RangeSelectivity(type, v, *range) : HOST_DEFAULT_SELECTIVITY;
++	}
++	default:
++		return HOST_DEFAULT_SELECTIVITY;
++	}
++}
++
++double TableFilterSelectivity(ClientContext &context, LogicalGet &get, idx_t table_column, TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::EXPRESSION_FILTER:
++		return ExpressionFilterSelectivity(context, get, table_column, *filter.Cast<ExpressionFilter>().expr);
++	case TableFilterType::CONSTANT_COMPARISON: {
++		auto &cf = filter.Cast<ConstantFilter>();
++		bool ok;
++		double lit = ValueAsDouble(cf.constant, ok);
++		auto range = ColumnRange(context, get, table_column);
++		if (!ok || !range) {
++			return HOST_DEFAULT_SELECTIVITY;
++		}
++		return RangeSelectivity(cf.comparison_type, lit, *range);
++	}
++	case TableFilterType::CONJUNCTION_AND: {
++		double sel = 1.0;
++		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
++			sel *= TableFilterSelectivity(context, get, table_column, *child);
++		}
++		return sel;
++	}
++	case TableFilterType::CONJUNCTION_OR: {
++		double sel = 0.0;
++		for (auto &child : filter.Cast<ConjunctionOrFilter>().child_filters) {
++			sel += TableFilterSelectivity(context, get, table_column, *child);
++		}
++		return std::min(1.0, sel);
++	}
++	case TableFilterType::OPTIONAL_FILTER:
++		return TableFilterSelectivity(context, get, table_column, *filter.Cast<OptionalFilter>().child_filter);
++	case TableFilterType::IS_NOT_NULL:
++		return 1.0;
++	default:
++		return HOST_DEFAULT_SELECTIVITY;
++	}
++}
++
++const BoundColumnRefExpression *AsColumnRef(const Expression &e) {
++	auto cur = &e;
++	while (cur->type == ExpressionType::OPERATOR_CAST) {
++		cur = cur->Cast<BoundCastExpression>().child.get();
++	}
++	return cur->type == ExpressionType::BOUND_COLUMN_REF ? &cur->Cast<BoundColumnRefExpression>() : nullptr;
++}
++
++double ExpressionSelectivity(ClientContext &context, LogicalGet &get, const Expression &e) {
++	switch (e.type) {
++	case ExpressionType::CONJUNCTION_AND: {
++		double sel = 1.0;
++		for (auto &child : e.Cast<BoundConjunctionExpression>().children) {
++			sel *= ExpressionSelectivity(context, get, *child);
++		}
++		return sel;
++	}
++	case ExpressionType::CONJUNCTION_OR: {
++		double sel = 0.0;
++		for (auto &child : e.Cast<BoundConjunctionExpression>().children) {
++			sel += ExpressionSelectivity(context, get, *child);
++		}
++		return std::min(1.0, sel);
++	}
++	case ExpressionType::COMPARE_EQUAL:
++	case ExpressionType::COMPARE_LESSTHAN:
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++	case ExpressionType::COMPARE_GREATERTHAN:
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
++		auto &cmp = e.Cast<BoundComparisonExpression>();
++		auto col = AsColumnRef(*cmp.left);
++		auto lit = cmp.right->type == ExpressionType::VALUE_CONSTANT ? &cmp.right->Cast<BoundConstantExpression>()
++		                                                              : nullptr;
++		auto type = e.type;
++		if (!col || !lit) {
++			col = AsColumnRef(*cmp.right);
++			lit = cmp.left->type == ExpressionType::VALUE_CONSTANT ? &cmp.left->Cast<BoundConstantExpression>()
++			                                                       : nullptr;
++			type = FlipComparisonExpression(e.type);
++		}
++		if (!col || !lit || col->binding.table_index != get.table_index) {
++			return HOST_DEFAULT_SELECTIVITY;
++		}
++		auto table_column = TableColumnOf(get, col->binding.column_index);
++		bool ok;
++		double v = ValueAsDouble(lit->value, ok);
++		if (!table_column.IsValid() || !ok) {
++			return HOST_DEFAULT_SELECTIVITY;
++		}
++		auto range = ColumnRange(context, get, table_column.GetIndex());
++		return range ? RangeSelectivity(type, v, *range) : HOST_DEFAULT_SELECTIVITY;
++	}
++	default:
++		return HOST_DEFAULT_SELECTIVITY;
++	}
++}
++
++struct TableInfo {
++	LogicalOperator *op = nullptr; // the registered table operator (filter over get, or get)
++	LogicalGet *get = nullptr;
++	double base_rows = 0;      // rows in storage
++	double selectivity = 1.0;  // of the table's own predicates
++	vector<pair<idx_t, idx_t>> key_columns; // (output column index, key class)
++	idx_t joins_above = 0;     // join operators between this table and the root
++};
++
++} // namespace
++
++// Every LogicalCreateBF / LogicalUseBF chain RPT+ produced, walked in execution order.
++struct RPTGFilterRef {
++	shared_ptr<FilterPlan> plan;
++	LogicalCreateBF *creator;
++	idx_t build_table;
++	bool backward;
++};
++
++void PredicateTransferOptimizer::RPTGPrune(LogicalOperator &root) {
++	auto mode = static_cast<int>(EnvDouble("RPTG_MODE", 0));
++	if (mode <= 0) {
++		return;
++	}
++	auto beta = EnvDouble("RPTG_BETA", 1.0);
++	auto c_mat = EnvDouble("RPTG_C_MAT", 3.0);     // materialize + filter-insert per build row, in probe units
++	auto c_probe = EnvDouble("RPTG_C_PROBE", 0.3); // BF probe per apply row
++	auto &context = graph_manager.context;
++	auto &tom = graph_manager.table_operator_manager;
++
++	// ---- tables ---------------------------------------------------------------------------------
++	unordered_map<idx_t, TableInfo> tables;
++	for (auto &entry : tom.table_operators) {
++		TableInfo t;
++		t.op = entry.second;
++		LogicalOperator *op = t.op;
++		while (op && op->type != LogicalOperatorType::LOGICAL_GET) {
++			op = op->children.empty() ? nullptr : op->children[0].get();
++		}
++		if (!op) {
++			continue;
++		}
++		if (t.op->type != LogicalOperatorType::LOGICAL_GET && t.op->type != LogicalOperatorType::LOGICAL_FILTER) {
++			continue; // aggregates etc. registered by RPT+ as tables are not base scans
++		}
++		t.get = &op->Cast<LogicalGet>();
++		auto table = t.get->GetTable();
++		if (!table || table->type != CatalogType::TABLE_ENTRY) {
++			continue;
++		}
++		t.base_rows = static_cast<double>(table->Cast<DuckTableEntry>().GetStorage().GetTotalRows());
++		for (auto &f : t.get->table_filters.filters) {
++			// table filters are keyed by the table's column id (LogicalGet prints names[column_index])
++			t.selectivity *= TableFilterSelectivity(context, *t.get, f.first, *f.second);
++		}
++		if (t.op->type == LogicalOperatorType::LOGICAL_FILTER) {
++			for (auto &e : t.op->expressions) {
++				t.selectivity *= ExpressionSelectivity(context, *t.get, *e);
++			}
++		}
++		tables[entry.first] = std::move(t);
++	}
++	// joins above every table
++	std::function<void(LogicalOperator &, idx_t)> walk = [&](LogicalOperator &op, idx_t joins) {
++		auto idx = TableOperatorManager::GetScalarTableIndex(&op);
++		bool leaf = op.type == LogicalOperatorType::LOGICAL_GET || op.type == LogicalOperatorType::LOGICAL_FILTER;
++		if (leaf && idx != std::numeric_limits<idx_t>::max() && tables.count(idx) && tables[idx].op == &op) {
++			tables[idx].joins_above = joins;
++			return;
++		}
++		bool is_join = op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
++		               op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN;
++		for (auto &child : op.children) {
++			walk(*child, joins + (is_join ? 1 : 0));
++		}
++	};
++	walk(root, 0);
++	if (Debug()) {
++		std::function<void(LogicalOperator &, int)> dump = [&](LogicalOperator &op, int depth) {
++			auto idx = TableOperatorManager::GetScalarTableIndex(&op);
++			fprintf(stderr, "[rptg]   %*s%s idx=%s registered=%d\n", depth * 2, "", LogicalOperatorToString(op.type).c_str(),
++			        idx == std::numeric_limits<idx_t>::max() ? "-" : std::to_string(idx).c_str(),
++			        idx != std::numeric_limits<idx_t>::max() && tables.count(idx) && tables[idx].op == &op);
++			for (auto &child : op.children) {
++				dump(*child, depth + 1);
++			}
++		};
++		dump(root, 0);
++	}
++
++	// ---- key classes (pattern vertices) from RPT+'s join-key groups ------------------------------
++	unordered_map<JoinKeyTableGroup *, idx_t> class_of;
++	vector<JoinKeyTableGroup *> classes;
++	auto class_id = [&](const ColumnBinding &b) -> idx_t {
++		auto renamed = tom.GetRenaming(b);
++		auto it = graph_manager.table_groups.find(renamed);
++		if (it == graph_manager.table_groups.end() || !it->second) {
++			return std::numeric_limits<idx_t>::max();
++		}
++		auto g = it->second.get();
++		if (!class_of.count(g)) {
++			class_of[g] = classes.size();
++			classes.push_back(g);
++		}
++		return class_of[g];
++	};
++
++	// key columns of every table from all join conditions (not only from the filter plans)
++	for (auto &entry : graph_manager.table_join_keys) {
++		if (!tables.count(entry.first)) {
++			continue;
++		}
++		for (auto &b : entry.second) {
++			auto c = class_id(b);
++			if (c == std::numeric_limits<idx_t>::max()) {
++				continue;
++			}
++			auto &kc = tables[entry.first].key_columns;
++			if (std::find(kc.begin(), kc.end(), make_pair(b.column_index, c)) == kc.end()) {
++				kc.emplace_back(b.column_index, c);
++			}
++		}
++	}
++
++	// ---- filters in execution order -------------------------------------------------------------
++	vector<RPTGFilterRef> refs;
++	auto collect = [&](std::unordered_map<LogicalOperator *, unique_ptr<LogicalOperator>> &mods, bool backward) {
++		auto order = graph_manager.transfer_order;
++		if (!backward) {
++			std::reverse(order.begin(), order.end());
++		}
++		for (auto node : order) {
++			auto it = mods.find(node);
++			if (it == mods.end()) {
++				continue;
++			}
++			auto op = it->second.get();
++			while (op) {
++				if (op->type == LogicalOperatorType::LOGICAL_CREATE_BF) {
++					auto &c = op->Cast<LogicalCreateBF>();
++					for (auto &p : c.filter_plans) {
++						refs.push_back(RPTGFilterRef {p, &c, TableOperatorManager::GetScalarTableIndex(node), backward});
++					}
++				}
++				op = op->children.empty() ? nullptr : op->children[0].get();
++			}
++		}
++	};
++	collect(forward_stage_modification, false);
++	collect(backward_stage_modification, true);
++	if (refs.empty()) {
++		return;
++	}
++	for (auto &r : refs) {
++		for (auto &b : r.plan->build) {
++			auto c = class_id(b);
++			if (c != std::numeric_limits<idx_t>::max() && tables.count(r.build_table)) {
++				auto &kc = tables[r.build_table].key_columns;
++				if (std::find(kc.begin(), kc.end(), make_pair(b.column_index, c)) == kc.end()) {
++					kc.emplace_back(b.column_index, c);
++				}
++			}
++		}
++		for (auto &a : r.plan->apply) {
++			auto c = class_id(a);
++			auto t = tom.GetRenaming(a).table_index;
++			if (c != std::numeric_limits<idx_t>::max() && tables.count(t)) {
++				auto &kc = tables[t].key_columns;
++				if (std::find(kc.begin(), kc.end(), make_pair(a.column_index, c)) == kc.end()) {
++					kc.emplace_back(a.column_index, c);
++				}
++			}
++		}
++	}
++
++	// ---- graph statistics --------------------------------------------------------------------
++	// n = rows of the vertex table (a table with one key column); |E| = rows of an edge-table copy.
++	// The vertex table is the smallest keyed table, the edge table the largest (a pattern-edge copy at a
++	// leaf of the pattern joins on one column only, so the number of key columns does not tell them apart).
++	double n = 0, num_edges = 0;
++	for (auto &entry : tables) {
++		auto &t = entry.second;
++		if (t.key_columns.empty()) {
++			continue;
++		}
++		n = n == 0 ? t.base_rows : std::min(n, t.base_rows);
++		num_edges = std::max(num_edges, t.base_rows);
++	}
++	if (n <= 0) {
++		n = 1;
++	}
++	auto is_vertex_table = [&](const TableInfo &t) { return t.base_rows <= n; };
++	double avgdeg = num_edges > n ? num_edges / n : 1.0;
++
++	// work of the join tree for given table row estimates: every join costs its inputs and produces
++	// l * r / n rows (equality on vertex ids); scans cost their rows
++	// Semi-join reduction removes dangling tuples only: the final join output is invariant, so it is
++	// not part of the work a filter can remove. Counted: rows leaving every scan (probe/build inputs)
++	// and the outputs of intermediate joins.
++	std::function<double(LogicalOperator &, unordered_map<idx_t, double> &, double &, bool)> tree_rows =
++	    [&](LogicalOperator &op, unordered_map<idx_t, double> &rows_est, double &work, bool root_join) -> double {
++		auto idx = TableOperatorManager::GetScalarTableIndex(&op);
++		bool leaf = op.type == LogicalOperatorType::LOGICAL_GET || op.type == LogicalOperatorType::LOGICAL_FILTER;
++		if (leaf && idx != std::numeric_limits<idx_t>::max() && rows_est.count(idx)) {
++			work += rows_est[idx];
++			return rows_est[idx];
++		}
++		bool is_join = op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
++		               op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN;
++		if (is_join && op.children.size() == 2) {
++			double l = tree_rows(*op.children[0], rows_est, work, false);
++			double r = tree_rows(*op.children[1], rows_est, work, false);
++			double out = l * r / std::max(n, 1.0);
++			if (!root_join) {
++				work += out;
++			}
++			return out;
++		}
++		double last = 0;
++		for (auto &child : op.children) {
++			last = tree_rows(*child, rows_est, work, root_join);
++		}
++		return last;
++	};
++	auto plan_work = [&](unordered_map<idx_t, double> &rows_est) {
++		double work = 0;
++		tree_rows(root, rows_est, work, true);
++		return work;
++	};
++
++	// candidate-set estimate per class: min over vertex tables of the class of their filtered rows
++	vector<double> size(classes.size(), n);
++	unordered_map<idx_t, double> rows; // estimated rows leaving each table's scan (own filters + admitted BFs)
++	for (auto &entry : tables) {
++		auto &t = entry.second;
++		rows[entry.first] = t.base_rows * t.selectivity;
++		if (is_vertex_table(t) && !t.key_columns.empty()) {
++			size[t.key_columns[0].second] = std::min(size[t.key_columns[0].second], rows[entry.first]);
++		}
++	}
++
++	// ---- decisions -----------------------------------------------------------------------------
++	unordered_set<FilterPlan *> dropped;
++	unordered_map<LogicalCreateBF *, idx_t> plans_per_creator;
++	for (auto &r : refs) {
++		plans_per_creator[r.creator]++;
++	}
++	for (auto &r : refs) {
++		if (!tables.count(r.build_table) || r.plan->build.empty() || r.plan->apply.empty()) {
++			continue;
++		}
++		auto &T = tables[r.build_table];
++		auto build_class = class_id(r.plan->build[0]);
++		if (build_class == std::numeric_limits<idx_t>::max()) {
++			continue;
++		}
++		// keys produced by the build side: a vertex table gives its candidate set; an edge table gives
++		// the endpoints of its surviving rows (each vertex appears if any of its avgdeg rows survives)
++		double keys;
++		if (is_vertex_table(T)) {
++			keys = std::min(size[build_class], rows[r.build_table]);
++		} else {
++			double rho = std::min(1.0, rows[r.build_table] / std::max(num_edges, 1.0));
++			keys = n * (1.0 - std::pow(1.0 - rho, avgdeg));
++			keys = std::min(keys, size[build_class]);
++		}
++		double surv = std::min(1.0, keys / n); // P(a random key value of this class is among the keys)
++		double cost = rows[r.build_table] * c_mat / plans_per_creator[r.creator];
++		vector<idx_t> apply_tables;
++		auto rows_with = rows;
++		for (auto &a : r.plan->apply) {
++			auto ti = tom.GetRenaming(a).table_index;
++			if (!tables.count(ti)) {
++				continue;
++			}
++			apply_tables.push_back(ti);
++			rows_with[ti] = rows[ti] * surv;
++			cost += rows[ti] * c_probe;
++		}
++		double benefit = plan_work(rows) - plan_work(rows_with);
++		bool run = cost <= beta * benefit;
++		if (Debug()) {
++			fprintf(stderr, "[rptg] %s build T%llu(%s rows~%.0f) class %llu keys~%.0f -> apply", r.backward ? "bwd" : "fwd",
++			        (unsigned long long)r.build_table, is_vertex_table(T) ? "V" : "E", rows[r.build_table],
++			        (unsigned long long)build_class, keys);
++			for (auto ti : apply_tables) {
++				fprintf(stderr, " T%llu(rows~%.0f,joins %llu)", (unsigned long long)ti, rows[ti],
++				        (unsigned long long)tables[ti].joins_above);
++			}
++			fprintf(stderr, " | cost %.0f benefit %.0f (plan work %.0f) -> %s\n", cost, benefit, plan_work(rows),
++			        run ? "KEEP" : "DROP");
++		}
++		if (!run) {
++			dropped.insert(r.plan.get());
++			continue;
++		}
++		for (auto ti : apply_tables) {
++			rows[ti] *= surv;
++			auto &U = tables[ti];
++			if (is_vertex_table(U) && !U.key_columns.empty()) {
++				size[U.key_columns[0].second] = std::min(size[U.key_columns[0].second], rows[ti]);
++			}
++		}
++		if (is_vertex_table(T)) {
++			size[build_class] = std::min(size[build_class], keys);
++		}
++	}
++	if (dropped.empty()) {
++		return;
++	}
++	// Bisection aid: RPTG_ONLY_DROP=k drops only the k-th (0-based) plan the decisions dropped.
++	if (auto only = std::getenv("RPTG_ONLY_DROP")) {
++		idx_t k = static_cast<idx_t>(std::atoi(only)), i = 0;
++		unordered_set<FilterPlan *> one;
++		for (auto &r : refs) {
++			if (dropped.count(r.plan.get())) {
++				if (i++ == k) {
++					one.insert(r.plan.get());
++					if (Debug()) {
++						fprintf(stderr, "[rptg] only dropping: build T%llu -> apply T%llu (%s)\n",
++						        (unsigned long long)r.build_table,
++						        (unsigned long long)tom.GetRenaming(r.plan->apply[0]).table_index, r.backward ? "bwd" : "fwd");
++					}
++				}
++			}
++		}
++		dropped = one;
++	}
++
++	// ---- apply: remove dropped plans from creators and users, unwrap empty operators --------------
++	// every plan pointer held by any creator, for the consistency check below
++	unordered_set<FilterPlan *> creator_plans;
++	for (auto &r : refs) {
++		creator_plans.insert(r.plan.get());
++	}
++	idx_t removed_users = 0, removed_creator_plans = 0, unmatched_users = 0;
++	auto rebuild = [&](std::unordered_map<LogicalOperator *, unique_ptr<LogicalOperator>> &mods) {
++		vector<LogicalOperator *> empty_entries;
++		for (auto &entry : mods) {
++			// chain of CreateBF / UseBF operators ending in a null child (the table is spliced in later)
++			vector<unique_ptr<LogicalOperator>> chain;
++			if (Debug()) {
++				fprintf(stderr, "[rptg] rebuild entry T%llu: %s\n",
++				        (unsigned long long)TableOperatorManager::GetScalarTableIndex(entry.first),
++				        entry.second ? LogicalOperatorToString(entry.second->type).c_str() : "<null>");
++			}
++			unique_ptr<LogicalOperator> cur = std::move(entry.second);
++			while (cur) {
++				unique_ptr<LogicalOperator> next;
++				if (Debug()) {
++					fprintf(stderr, "[rptg]   op %s children=%zu%s\n", LogicalOperatorToString(cur->type).c_str(),
++					        cur->children.size(), !cur->children.empty() && !cur->children[0] ? " (child[0] is NULL)" : "");
++				}
++				if (!cur->children.empty() && cur->children[0]) {
++					next = std::move(cur->children[0]);
++				}
++				cur->children.clear();
++				bool keep = true;
++				if (cur->type == LogicalOperatorType::LOGICAL_CREATE_BF) {
++					auto &c = cur->Cast<LogicalCreateBF>();
++					vector<shared_ptr<FilterPlan>> kept;
++					for (auto &p : c.filter_plans) {
++						if (!dropped.count(p.get())) {
++							kept.push_back(p);
++						} else {
++							removed_creator_plans++;
++						}
++					}
++					c.filter_plans = std::move(kept);
++					keep = !c.filter_plans.empty();
++				} else if (cur->type == LogicalOperatorType::LOGICAL_USE_BF) {
++					auto plan_ptr = cur->Cast<LogicalUseBF>().filter_plan.get();
++					if (!creator_plans.count(plan_ptr)) {
++						unmatched_users++;
++					}
++					keep = !dropped.count(plan_ptr);
++					removed_users += keep ? 0 : 1;
++				}
++				if (keep) {
++					chain.push_back(std::move(cur));
++				}
++				cur = std::move(next);
++			}
++			if (chain.empty()) {
++				empty_entries.push_back(entry.first);
++				continue;
++			}
++			if (Debug()) {
++				fprintf(stderr, "[rptg] chain for T%llu:", (unsigned long long)TableOperatorManager::GetScalarTableIndex(entry.first));
++				for (auto &op : chain) {
++					if (op->type == LogicalOperatorType::LOGICAL_CREATE_BF) {
++						fprintf(stderr, " CREATE(%zu)", op->Cast<LogicalCreateBF>().filter_plans.size());
++					} else {
++						fprintf(stderr, " USE(T%llu)", (unsigned long long)tom.GetRenaming(op->Cast<LogicalUseBF>().filter_plan->build[0]).table_index);
++					}
++				}
++				fprintf(stderr, "\n");
++			}
++			// relink bottom-up: moving chain[i+1] into chain[i] must happen after chain[i+1] got its own child
++			for (idx_t i = chain.size() - 1; i > 0; i--) {
++				chain[i - 1]->children.push_back(std::move(chain[i]));
++			}
++			entry.second = std::move(chain[0]);
++		}
++		for (auto key : empty_entries) {
++			mods.erase(key);
++		}
++	};
++	rebuild(forward_stage_modification);
++	rebuild(backward_stage_modification);
++	if (Debug()) {
++		fprintf(stderr, "[rptg] dropped %zu of %zu filter plans: removed %llu creator plans, %llu users; users whose plan pointer is unknown to any creator: %llu\n",
++		        dropped.size(), refs.size(), (unsigned long long)removed_creator_plans, (unsigned long long)removed_users,
++		        (unsigned long long)unmatched_users);
++	}
++}
++
++} // namespace duckdb

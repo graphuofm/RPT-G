@@ -1,0 +1,11 @@
+$ python scripts/analyze_cli.py vanilla=results/dblp_qgen_duckdb130.csv rptplus=results/dblp_qgen_rptplus.csv
+baseline vanilla: 4767 queries evaluated (233 baseline timeouts excluded of 5000 common)
+noise floor (vanilla rep0/rep1): <0.8 3.4%  <0.5 0.2%  >1.25 4.8%  >2 0.0%
+config             <0.8   <0.5  >1.25     >2  geomean     P5    P50    P95  total s  tmo fixed/new  count mismatch
+vanilla                                                                   1453
+rptplus           38.6%   8.1%  19.1%   6.3%    0.905   0.42   0.87   2.24     1523      7/11                    0
+by baseline time (geomean, share <0.8x):
+      0-20     ms n=1998  rptplus: 0.75 (51%)
+     20-100    ms n=1817  rptplus: 0.99 (33%)
+    100-1000   ms n= 577  rptplus: 1.20 (23%)
+   1000-inf    ms n= 375  rptplus: 1.09 (23%)

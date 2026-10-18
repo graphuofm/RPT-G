@@ -1,0 +1,17 @@
+$ python scripts/analyze_robust_host.py results/dblp_robust100d.csv --base M0
+results/dblp_robust100d.csv: 100 queries, 5000 (query, order) pairs, configs ['M0', 'M4', 'M6'], count mismatches vs M0: {'M4': 0, 'M6': 0}
+config factor geo    med    P90     max  worst sum median sum  best sum worst/base-best timeouts
+M0          17.93   8.08  433.2  2111.9     147.0s      40.1s      2.1s           17.93      100
+M4           1.75   1.32    4.3    15.5       4.8s       2.7s      1.9s            2.71        0
+M6           2.51   1.53   12.7    34.8       5.5s       2.4s      1.0s            2.26        0
+M4 per (query, order) vs M0: geomean 2.08, < 0.8x 29.5%, > 2x 38.3%, > 10x 17.9%, timeouts fixed 100 / new 0
+M6 per (query, order) vs M0: geomean 2.95, < 0.8x 2.5%, > 2x 44.9%, > 10x 18.6%, timeouts fixed 100 / new 0
+
+$ python scripts/analyze_robust_host.py results/lj_robust100.csv --base M0
+results/lj_robust100.csv: 100 queries, 5000 (query, order) pairs, configs ['M0', 'M4', 'M6'], count mismatches vs M0: {'M4': 0, 'M6': 0}
+config factor geo    med    P90     max  worst sum median sum  best sum worst/base-best timeouts
+M0          22.38  21.10  138.4   527.3     337.6s     134.5s      8.5s           22.38      515
+M4           2.22   2.30    3.1     4.1      46.6s      27.2s     21.0s            5.61        0
+M6           3.60   2.95    9.1    49.1      32.4s      12.4s      7.1s            3.41        0
+M4 per (query, order) vs M0: geomean 1.51, < 0.8x 31.6%, > 2x 33.2%, > 10x 15.6%, timeouts fixed 515 / new 0
+M6 per (query, order) vs M0: geomean 3.23, < 0.8x 5.9%, > 2x 46.5%, > 10x 22.3%, timeouts fixed 515 / new 0

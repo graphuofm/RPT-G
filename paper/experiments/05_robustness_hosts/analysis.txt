@@ -1,0 +1,22 @@
+$ python scripts/analyze_robust_host.py results/kuzu_dblp_robust.csv --base KNO
+results/kuzu_dblp_robust.csv: 100 queries, 1918 (query, order) pairs, configs ['KNO', 'KR2', 'KSM'], count mismatches vs KNO: {'KR2': 0, 'KSM': 0}
+config factor geo    med    P90     max  worst sum median sum  best sum worst/base-best timeouts
+KNO          4.50   3.25   24.1    40.5     304.4s      93.4s     36.7s            4.50       88
+KR2          5.11   2.93   40.0   289.9     140.4s      27.9s     13.5s            0.90       23
+KSM         10.87   9.72   43.3   735.0     257.9s      61.2s     18.4s            3.53       59
+KR2 per (query, order) vs KNO: geomean 8.17, < 0.8x 0.0%, > 2x 85.5%, > 10x 50.4%, timeouts fixed 65 / new 0
+KSM per (query, order) vs KNO: geomean 2.54, < 0.8x 4.5%, > 2x 44.6%, > 10x 15.8%, timeouts fixed 30 / new 1
+
+$ python scripts/analyze_robust_host.py results/pg19_dblp_robust.csv --base PGNO
+results/pg19_dblp_robust.csv: 100 queries, 1918 (query, order) pairs, configs ['PGNO', 'PGR'], count mismatches vs PGNO: {'PGR': 0}
+config factor geo    med    P90     max  worst sum median sum  best sum worst/base-best timeouts
+PGNO        43.23  29.29  842.5  6068.3     461.9s     255.2s     41.2s           43.23      462
+PGR         10.68   8.24   82.2  4666.4     169.4s      77.4s     28.1s            8.44      142
+PGR per (query, order) vs PGNO: geomean 4.83, < 0.8x 1.6%, > 2x 52.0%, > 10x 27.8%, timeouts fixed 322 / new 2
+
+$ python scripts/analyze_robust_host.py results/duckdb_dblp_robust.csv --base dk0
+results/duckdb_dblp_robust.csv: 100 queries, 1918 (query, order) pairs, configs ['dk0', 'dkr'], count mismatches vs dk0: {'dkr': 0}
+config factor geo    med    P90     max  worst sum median sum  best sum worst/base-best timeouts
+dk0          6.73   4.05   91.1   217.4     140.0s      46.5s      5.6s            6.73       50
+dkr          3.19   2.84   12.2    31.4      19.8s      11.0s      4.4s            2.87        0
+dkr per (query, order) vs dk0: geomean 1.66, < 0.8x 2.9%, > 2x 19.9%, > 10x 9.7%, timeouts fixed 50 / new 0

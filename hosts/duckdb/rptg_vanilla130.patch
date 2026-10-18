@@ -1,0 +1,1282 @@
+diff --git a/src/optimizer/rptg_optimizer.cpp b/src/optimizer/rptg_optimizer.cpp
+new file mode 100644
+index 0000000..5fbdb61
+--- /dev/null
++++ b/src/optimizer/rptg_optimizer.cpp
+@@ -0,0 +1,1276 @@
++//===----------------------------------------------------------------------===//
++// RPT-G: robust predicate transfer for graph pattern queries (vanilla DuckDB 1.3.0)
++//
++// Runs after every built-in optimizer, so the join order is DuckDB's own and stays unchanged.
++// 1. Recognizes a pattern query: inner equi-joins over copies of an edge table E(src, dst) and a vertex
++//    table V(id, ...), where each V copy carries the predicates of one pattern vertex.
++// 2. Builds the adjacency index of E once per process (side connection), evaluates each vertex's
++//    predicates (side connection), and runs the RPT-G transfer phase (prototype Engine via rptg_c.h)
++//    under DuckDB's join order (leaf order of the E scans).
++// 3. Inserts a filter rptg_member(col) above the scans of vertices that the transfers reduced beyond
++//    their own predicates, except where a join directly above discards the same rows anyway.
++// Environment: RPTG_MODE=1 enables, RPTG_BETA (1.0), RPTG_DEBUG=1 prints decisions to stderr.
++// Correctness never depends on the decisions: every bitmap is a superset of the vertices in any match.
++//===----------------------------------------------------------------------===//
++#include "duckdb/optimizer/rptg_optimizer.hpp"
++#include "duckdb/parser/keyword_helper.hpp"
++
++#include "duckdb/common/types/data_chunk.hpp"
++#include "duckdb/main/client_context.hpp"
++#include "duckdb/main/connection.hpp"
++#include "duckdb/main/database.hpp"
++#include "duckdb/planner/expression/bound_cast_expression.hpp"
++#include "duckdb/planner/expression/bound_columnref_expression.hpp"
++#include "duckdb/planner/expression/bound_comparison_expression.hpp"
++#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
++#include "duckdb/planner/expression_iterator.hpp"
++#include "duckdb/planner/operator/logical_comparison_join.hpp"
++#include "duckdb/planner/operator/logical_filter.hpp"
++#include "duckdb/planner/operator/logical_get.hpp"
++#include "duckdb/planner/operator/logical_projection.hpp"
++#include "duckdb/planner/filter/constant_filter.hpp"
++#include "duckdb/planner/filter/conjunction_filter.hpp"
++#include "duckdb/planner/filter/expression_filter.hpp"
++#include "duckdb/planner/filter/optional_filter.hpp"
++#include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/storage/statistics/numeric_stats.hpp"
++#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
++
++#include "rptg_c.h"
++
++#include <chrono>
++#include <limits>
++#include <functional>
++#include <map>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++
++namespace duckdb {
++
++namespace rptg_detail {
++
++const int MAXV = 32;
++
++thread_local bool in_rptg = false;
++
++struct GraphCache {
++	std::mutex lock;
++	rptg_graph *graph = nullptr;
++	string key;
++	double build_ms = 0;
++	DatabaseInstance *db = nullptr;
++	unique_ptr<Connection> con; // side connection, kept for the process (queries run one at a time)
++	std::map<string, rptg_colindex *> colidx; // predicate column indexes of V, built once per process
++};
++GraphCache &Cache() {
++	static GraphCache cache;
++	return cache;
++}
++
++bool Enabled() {
++	const char *m = std::getenv("RPTG_MODE");
++	return m && std::atoi(m) > 0;
++}
++// Calibration for DuckDB (8 threads, vectorized): a row through a plan operator costs ~0.4 ns of wall time,
++// an adjacency entry of the single-threaded transfer phase ~4 ns -> beta 0.1; a bitmap test on a scanned
++// row ~0.3 cost units.
++double Beta() {
++	const char *b = std::getenv("RPTG_BETA");
++	return b ? std::atof(b) : 0.1;
++}
++double FilterCost() {
++	const char *b = std::getenv("RPTG_FILTER_COST");
++	return b ? std::atof(b) : 0.3;
++}
++// predicate sets estimated at most this many rows are materialized before the pre-screen
++double ExactRows() {
++	const char *b = std::getenv("RPTG_EXACT_ROWS");
++	return b ? std::atof(b) : 50000.0;
++}
++// fixed cost of the side queries of a transfer phase (~2 ms in units of ~4 ns)
++double FirstCost() {
++	const char *b = std::getenv("RPTG_FIRST_COST");
++	return b ? std::atof(b) : 500000.0;
++}
++// cost units per row of materializing a predicate set through the side connection (~60 ns per row vs
++// ~4 ns per adjacency entry of a transfer)
++double PredCost() {
++	const char *b = std::getenv("RPTG_PRED_COST");
++	return b ? std::atof(b) : 15.0;
++}
++bool Debug() {
++	return std::getenv("RPTG_DEBUG") != nullptr;
++}
++// predicate column indexes (sorted column + degree prefix sums): exact statistics by binary search
++bool UseColumnIndex() {
++	const char *b = std::getenv("RPTG_COLUMN_INDEX");
++	return b ? std::atoi(b) != 0 : true;
++}
++// with column indexes a transfer phase needs no side query: fixed cost ~0.4 ms, ~8 ns per materialized row
++double IndexFirstCost() {
++	const char *b = std::getenv("RPTG_INDEX_FIRST_COST");
++	return b ? std::atof(b) : 100000.0;
++}
++double IndexPredCost() {
++	const char *b = std::getenv("RPTG_INDEX_PRED_COST");
++	return b ? std::atof(b) : 2.0;
++}
++
++// a vertex predicate as a range lo < col < hi on one column: "col op const" (op < <= = >= >, the column
++// possibly widened to FLOAT/DOUBLE) and conjunctions of such comparisons on the same column
++struct ColRange {
++	string col;
++	double lo = -std::numeric_limits<double>::infinity(), hi = std::numeric_limits<double>::infinity();
++	bool lo_incl = false, hi_incl = false;
++};
++
++// ---------------------------------------------------------------- the member filter
++struct MemberData : public FunctionData {
++	shared_ptr<vector<uint64_t>> words;
++	explicit MemberData(shared_ptr<vector<uint64_t>> w) : words(std::move(w)) {
++	}
++	unique_ptr<FunctionData> Copy() const override {
++		return make_uniq<MemberData>(words);
++	}
++	bool Equals(const FunctionData &other) const override {
++		return words == other.Cast<MemberData>().words;
++	}
++};
++
++template <class T>
++void MemberTyped(DataChunk &args, const vector<uint64_t> &w, Vector &result) {
++	const uint64_t nbits = w.size() * 64;
++	UnaryExecutor::Execute<T, bool>(args.data[0], result, args.size(), [&](T v) {
++		return v >= 0 && uint64_t(v) < nbits && ((w[uint64_t(v) >> 6] >> (uint64_t(v) & 63)) & 1);
++	});
++}
++
++void MemberFunction(DataChunk &args, ExpressionState &state, Vector &result) {
++	auto &fexpr = state.expr.Cast<BoundFunctionExpression>();
++	auto &w = *fexpr.bind_info->Cast<MemberData>().words;
++	switch (args.data[0].GetType().InternalType()) {
++	case PhysicalType::INT32:
++		MemberTyped<int32_t>(args, w, result);
++		break;
++	default:
++		MemberTyped<int64_t>(args, w, result);
++		break;
++	}
++}
++
++// ---------------------------------------------------------------- plan-time selectivity (zone-map min/max)
++// DuckDB estimates every range predicate at 20% and wraps FLOAT < DOUBLE-literal comparisons in casts it
++// cannot estimate at all; the column min/max kept for zone maps gives a uniformity estimate for free.
++const double DEFAULT_SEL = 0.2;
++
++bool AsDouble(const Value &v, double &out) {
++	if (v.IsNull()) {
++		return false;
++	}
++	switch (v.type().InternalType()) {
++	case PhysicalType::DOUBLE:
++		out = v.GetValue<double>();
++		return true;
++	case PhysicalType::FLOAT:
++		out = double(v.GetValue<float>());
++		return true;
++	case PhysicalType::INT64:
++	case PhysicalType::INT32:
++	case PhysicalType::INT16:
++	case PhysicalType::INT8:
++		out = double(v.GetValue<int64_t>());
++		return true;
++	default:
++		return false;
++	}
++}
++
++bool ColumnMinMax(ClientContext &context, LogicalGet &get, idx_t column, double &lo, double &hi, bool &integral) {
++	if (!get.function.statistics) {
++		return false;
++	}
++	auto stats = get.function.statistics(context, get.bind_data.get(), column);
++	if (!stats || !NumericStats::HasMinMax(*stats)) {
++		return false;
++	}
++	integral = stats->GetType().IsIntegral();
++	return AsDouble(NumericStats::Min(*stats), lo) && AsDouble(NumericStats::Max(*stats), hi);
++}
++
++double RangeSel(ExpressionType cmp, double lit, double lo, double hi, bool integral) {
++	if (cmp == ExpressionType::COMPARE_EQUAL) {
++		return lit < lo || lit > hi ? 0.0 : (integral ? 1.0 / (hi - lo + 1.0) : 0.01);
++	}
++	if (hi <= lo) {
++		return DEFAULT_SEL;
++	}
++	double below = MinValue(1.0, MaxValue(0.0, (lit - lo) / (hi - lo)));
++	switch (cmp) {
++	case ExpressionType::COMPARE_LESSTHAN:
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++		return below;
++	case ExpressionType::COMPARE_GREATERTHAN:
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++		return 1.0 - below;
++	default:
++		return DEFAULT_SEL;
++	}
++}
++
++bool IsColumnLeaf(const Expression &e) {
++	auto cur = &e;
++	while (cur->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
++		cur = cur->Cast<BoundCastExpression>().child.get();
++	}
++	return cur->type == ExpressionType::BOUND_REF || cur->type == ExpressionType::BOUND_COLUMN_REF;
++}
++
++bool ExprRange(const Expression &e, ColRange &r) {
++	if (e.type == ExpressionType::CONJUNCTION_AND) {
++		for (auto &child : e.Cast<BoundConjunctionExpression>().children) {
++			if (!ExprRange(*child, r)) {
++				return false;
++			}
++		}
++		return true;
++	}
++	if (e.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
++		return false;
++	}
++	auto &cmp = e.Cast<BoundComparisonExpression>();
++	auto type = e.type;
++	const Expression *col = nullptr, *lit = nullptr;
++	if (IsColumnLeaf(*cmp.left) && cmp.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
++		col = cmp.left.get();
++		lit = cmp.right.get();
++	} else if (IsColumnLeaf(*cmp.right) && cmp.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
++		col = cmp.right.get();
++		lit = cmp.left.get();
++		type = FlipComparisonExpression(type);
++	} else {
++		return false;
++	}
++	while (col->GetExpressionClass() == ExpressionClass::BOUND_CAST) { // only widening to a floating type
++		auto t = col->return_type.id();
++		if (t != LogicalTypeId::DOUBLE && t != LogicalTypeId::FLOAT) {
++			return false;
++		}
++		col = col->Cast<BoundCastExpression>().child.get();
++	}
++	if (!col->return_type.IsNumeric()) {
++		return false;
++	}
++	double v;
++	if (!AsDouble(lit->Cast<BoundConstantExpression>().value, v)) {
++		return false;
++	}
++	string name = col->alias.empty() ? col->GetName() : col->alias;
++	if (!r.col.empty() && r.col != name) {
++		return false;
++	}
++	r.col = name;
++	switch (type) {
++	case ExpressionType::COMPARE_LESSTHAN:
++	case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
++		bool incl = type == ExpressionType::COMPARE_LESSTHANOREQUALTO;
++		if (v < r.hi || (v == r.hi && !incl)) {
++			r.hi = v, r.hi_incl = incl;
++		}
++		return true;
++	}
++	case ExpressionType::COMPARE_GREATERTHAN:
++	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
++		bool incl = type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
++		if (v > r.lo || (v == r.lo && !incl)) {
++			r.lo = v, r.lo_incl = incl;
++		}
++		return true;
++	}
++	case ExpressionType::COMPARE_EQUAL:
++		if (v > r.lo || (v == r.lo && !r.lo_incl)) {
++			r.lo = v, r.lo_incl = true;
++		}
++		if (v < r.hi || (v == r.hi && !r.hi_incl)) {
++			r.hi = v, r.hi_incl = true;
++		}
++		return true;
++	default:
++		return false;
++	}
++}
++
++double ExprSel(ClientContext &context, LogicalGet &get, idx_t column, const Expression &e) {
++	if (e.type == ExpressionType::CONJUNCTION_AND || e.type == ExpressionType::CONJUNCTION_OR) {
++		double sel = e.type == ExpressionType::CONJUNCTION_AND ? 1.0 : 0.0;
++		for (auto &child : e.Cast<BoundConjunctionExpression>().children) {
++			double c = ExprSel(context, get, column, *child);
++			sel = e.type == ExpressionType::CONJUNCTION_AND ? sel * c : MinValue(1.0, sel + c);
++		}
++		return sel;
++	}
++	if (e.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
++		return DEFAULT_SEL;
++	}
++	auto &cmp = e.Cast<BoundComparisonExpression>();
++	auto type = e.type;
++	const Expression *lit = nullptr;
++	if (IsColumnLeaf(*cmp.left) && cmp.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
++		lit = cmp.right.get();
++	} else if (IsColumnLeaf(*cmp.right) && cmp.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
++		lit = cmp.left.get();
++		type = FlipComparisonExpression(type);
++	}
++	double v, lo, hi;
++	bool integral;
++	if (!lit || !AsDouble(lit->Cast<BoundConstantExpression>().value, v) ||
++	    !ColumnMinMax(context, get, column, lo, hi, integral)) {
++		return DEFAULT_SEL;
++	}
++	return RangeSel(type, v, lo, hi, integral);
++}
++
++double FilterSel(ClientContext &context, LogicalGet &get, idx_t column, const TableFilter &f) {
++	switch (f.filter_type) {
++	case TableFilterType::EXPRESSION_FILTER:
++		return ExprSel(context, get, column, *f.Cast<ExpressionFilter>().expr);
++	case TableFilterType::CONSTANT_COMPARISON: {
++		auto &cf = f.Cast<ConstantFilter>();
++		double v, lo, hi;
++		bool integral;
++		if (!AsDouble(cf.constant, v) || !ColumnMinMax(context, get, column, lo, hi, integral)) {
++			return DEFAULT_SEL;
++		}
++		return RangeSel(cf.comparison_type, v, lo, hi, integral);
++	}
++	case TableFilterType::CONJUNCTION_AND: {
++		double sel = 1.0;
++		for (auto &c : f.Cast<ConjunctionAndFilter>().child_filters) {
++			sel *= FilterSel(context, get, column, *c);
++		}
++		return sel;
++	}
++	case TableFilterType::OPTIONAL_FILTER:
++		return FilterSel(context, get, column, *f.Cast<OptionalFilter>().child_filter);
++	case TableFilterType::IS_NOT_NULL:
++		return 1.0;
++	default:
++		return DEFAULT_SEL;
++	}
++}
++
++// ---------------------------------------------------------------- recognition
++struct Source {
++	idx_t get_index; // table_index of the LogicalGet
++	idx_t column;    // column id in the table
++};
++
++struct Recognizer {
++	ClientContext &context;
++	bool ok = true;
++	unordered_map<idx_t, LogicalGet *> gets;      // table_index -> get
++	unordered_map<idx_t, int> kind;               // table_index -> 1 = E, 2 = V
++	std::map<std::pair<idx_t, idx_t>, Source> binding_source; // (table_index, column_index) -> source
++	vector<pair<Source, Source>> equalities;
++	unordered_map<idx_t, vector<unique_ptr<Expression>>> v_filters; // V get -> filter expressions (by name)
++	unordered_map<idx_t, double> v_sel;                               // V get -> estimated selectivity
++	vector<idx_t> leaf_order;                     // get table indexes in DFS (probe before build) order
++
++	explicit Recognizer(ClientContext &c) : context(c) {
++	}
++
++	static bool IsTable(LogicalGet &get, const char *name) {
++		auto table = get.GetTable();
++		return table && StringUtil::CIEquals(table->name, name);
++	}
++
++	bool Resolve(const Expression &e, Source &out) {
++		if (e.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
++			return Resolve(*e.Cast<BoundCastExpression>().child, out);
++		}
++		if (e.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
++			return false;
++		}
++		auto &ref = e.Cast<BoundColumnRefExpression>();
++		auto it = binding_source.find(std::make_pair(ref.binding.table_index, ref.binding.column_index));
++		if (it == binding_source.end()) {
++			return false;
++		}
++		out = it->second;
++		return true;
++	}
++
++	// first pass: gets and projections (bindings)
++	void CollectBindings(LogicalOperator &op) {
++		for (auto &child : op.children) {
++			CollectBindings(*child);
++		}
++		if (op.type == LogicalOperatorType::LOGICAL_GET) {
++			auto &get = op.Cast<LogicalGet>();
++			int k = IsTable(get, "e") ? 1 : IsTable(get, "v") ? 2 : 0;
++			if (k == 0) {
++				ok = false;
++				return;
++			}
++			gets[get.table_index] = &get;
++			kind[get.table_index] = k;
++			auto &ids = get.GetColumnIds();
++			for (auto &b : get.GetColumnBindings()) {
++				if (b.column_index < ids.size() && !ids[b.column_index].IsRowIdColumn()) {
++					binding_source[std::make_pair(b.table_index, b.column_index)] =
++					    Source {get.table_index, ids[b.column_index].GetPrimaryIndex()};
++				}
++			}
++		} else if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
++			auto &proj = op.Cast<LogicalProjection>();
++			for (idx_t i = 0; i < proj.expressions.size(); i++) {
++				Source s;
++				if (Resolve(*proj.expressions[i], s)) {
++					binding_source[std::make_pair(proj.table_index, i)] = s;
++				}
++			}
++		}
++	}
++
++	void AddFilterExpression(Expression &expr) {
++		// a conjunction of equalities between pattern columns and predicates on single V copies
++		if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
++		    expr.type == ExpressionType::CONJUNCTION_AND) {
++			for (auto &child : expr.Cast<BoundConjunctionExpression>().children) {
++				AddFilterExpression(*child);
++			}
++			return;
++		}
++		if (expr.type == ExpressionType::COMPARE_EQUAL && expr.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
++			auto &cmp = expr.Cast<BoundComparisonExpression>();
++			Source l, r;
++			if (Resolve(*cmp.left, l) && Resolve(*cmp.right, r)) {
++				equalities.emplace_back(l, r);
++				return;
++			}
++		}
++		// predicate: every column reference must resolve to one and the same V copy
++		idx_t target = DConstants::INVALID_INDEX;
++		bool single = true;
++		std::function<void(Expression &)> visit = [&](Expression &e) {
++			if (e.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++				Source s;
++				if (!Resolve(e, s) || kind[s.get_index] != 2 || (target != DConstants::INVALID_INDEX && target != s.get_index)) {
++					single = false;
++					return;
++				}
++				target = s.get_index;
++			}
++			ExpressionIterator::EnumerateChildren(e, visit);
++		};
++		visit(expr);
++		if (!single || target == DConstants::INVALID_INDEX) {
++			ok = false;
++			return;
++		}
++		// rename the column references to the V column names so that ToString() gives SQL over V
++		auto copy = expr.Copy();
++		auto &get = *gets[target];
++		std::function<void(unique_ptr<Expression> &)> rename = [&](unique_ptr<Expression> &e) {
++			if (e->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
++				Source s;
++				Resolve(*e, s);
++				e->alias = get.names[s.column];
++				return;
++			}
++			ExpressionIterator::EnumerateChildren(*e, rename);
++		};
++		rename(copy);
++		v_filters[target].push_back(std::move(copy));
++		v_sel[target] = (v_sel.count(target) ? v_sel[target] : 1.0) * DEFAULT_SEL;
++	}
++
++	// second pass: joins and filters
++	void CollectJoins(LogicalOperator &op) {
++		switch (op.type) {
++		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
++			auto &join = op.Cast<LogicalComparisonJoin>();
++			if (join.join_type != JoinType::INNER) {
++				ok = false;
++				return;
++			}
++			for (auto &cond : join.conditions) {
++				Source l, r;
++				if (cond.comparison != ExpressionType::COMPARE_EQUAL || !Resolve(*cond.left, l) || !Resolve(*cond.right, r)) {
++					ok = false;
++					return;
++				}
++				equalities.emplace_back(l, r);
++			}
++			break;
++		}
++		case LogicalOperatorType::LOGICAL_FILTER:
++			for (auto &e : op.expressions) {
++				AddFilterExpression(*e);
++			}
++			break;
++		case LogicalOperatorType::LOGICAL_GET: {
++			auto &get = op.Cast<LogicalGet>();
++			leaf_order.push_back(get.table_index);
++			if (kind[get.table_index] == 1 && !get.table_filters.filters.empty()) {
++				ok = false; // a predicate on an edge copy is not a pattern predicate
++				return;
++			}
++			if (kind[get.table_index] == 2) {
++				double sel = 1.0;
++				for (auto &f : get.table_filters.filters) {
++					sel *= FilterSel(context, get, f.first, *f.second);
++				}
++				v_sel[get.table_index] = sel;
++				for (auto &f : get.table_filters.filters) {
++					BoundColumnRefExpression col(get.names[f.first], get.returned_types[f.first],
++					                             ColumnBinding(get.table_index, 0));
++					v_filters[get.table_index].push_back(f.second->ToExpression(col));
++				}
++			}
++			break;
++		}
++		case LogicalOperatorType::LOGICAL_EXPLAIN:
++		case LogicalOperatorType::LOGICAL_PROJECTION:
++		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
++		case LogicalOperatorType::LOGICAL_ORDER_BY:
++		case LogicalOperatorType::LOGICAL_LIMIT:
++		case LogicalOperatorType::LOGICAL_TOP_N:
++			break;
++		default:
++			ok = false;
++			return;
++		}
++		// execution order: a hash join builds its right child before the left child streams through it,
++		// so the build side binds its vertices first (leaf order = build side first)
++		if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
++			for (idx_t i = op.children.size(); i-- > 0;) {
++				if (!ok) {
++					return;
++				}
++				CollectJoins(*op.children[i]);
++			}
++			return;
++		}
++		for (auto &child : op.children) {
++			if (!ok) {
++				return;
++			}
++			CollectJoins(*child);
++		}
++	}
++};
++
++// ---------------------------------------------------------------- filter placement
++struct Placement {
++	unordered_map<idx_t, int> kind;
++	unordered_map<idx_t, uint32_t> classes;           // get -> classes of its columns
++	unordered_map<idx_t, uint32_t> kept;              // get -> classes with a kept filter
++	struct Masks {
++		uint32_t present = 0, kept = 0;
++	};
++	static LogicalGet *DirectGet(LogicalOperator &op) {
++		auto p = &op;
++		while (p->type == LogicalOperatorType::LOGICAL_FILTER || p->type == LogicalOperatorType::LOGICAL_PROJECTION) {
++			if (p->children.size() != 1) {
++				return nullptr;
++			}
++			p = p->children[0].get();
++		}
++		return p->type == LogicalOperatorType::LOGICAL_GET ? &p->Cast<LogicalGet>() : nullptr;
++	}
++	Masks Visit(LogicalOperator &op) {
++		Masks m;
++		if (op.type == LogicalOperatorType::LOGICAL_GET) {
++			auto idx = op.Cast<LogicalGet>().table_index;
++			m.present = classes[idx];
++			m.kept = kept[idx];
++			return m;
++		}
++		if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && op.children.size() == 2) {
++			Masks l = Visit(*op.children[0]), r = Visit(*op.children[1]);
++			uint32_t both = l.present & r.present;
++			auto dl = DirectGet(*op.children[0]), dr = DirectGet(*op.children[1]);
++			for (int x = 0; x < MAXV; x++) {
++				uint32_t bit = 1u << x;
++				if (!(both & bit)) {
++					continue;
++				}
++				// the probe side (left) rows of a hash join are checked against the build side anyway
++				if (dl && (r.kept & bit) && (l.kept & bit)) {
++					kept[dl->table_index] &= ~bit;
++					l.kept &= ~bit;
++				} else if (dr && (l.kept & bit) && (r.kept & bit)) {
++					kept[dr->table_index] &= ~bit;
++					r.kept &= ~bit;
++				}
++			}
++			m.present = l.present | r.present;
++			m.kept = l.kept | r.kept;
++			return m;
++		}
++		for (auto &child : op.children) {
++			auto c = Visit(*child);
++			m.present |= c.present;
++			m.kept |= c.kept;
++		}
++		return m;
++	}
++};
++
++struct Member {
++	idx_t get_index;
++	idx_t column;
++	int x;
++};
++
++// smallest and largest member of a bitmap (lo > hi if empty)
++void Bounds(const vector<uint64_t> &w, int64_t &lo, int64_t &hi) {
++	lo = 1;
++	hi = 0;
++	for (idx_t i = 0; i < w.size(); i++) {
++		if (w[i]) {
++			lo = int64_t(i * 64 + __builtin_ctzll(w[i]));
++			break;
++		}
++	}
++	for (idx_t i = w.size(); i-- > 0;) {
++		if (w[i]) {
++			hi = int64_t(i * 64 + 63 - __builtin_clzll(w[i]));
++			break;
++		}
++	}
++}
++
++void InsertFilters(ClientContext &context, unique_ptr<LogicalOperator> &op, const vector<Member> &members,
++                   const vector<shared_ptr<vector<uint64_t>>> &bits, const ScalarFunction &fn) {
++	for (auto &child : op->children) {
++		InsertFilters(context, child, members, bits, fn);
++	}
++	if (op->type != LogicalOperatorType::LOGICAL_GET) {
++		return;
++	}
++	auto &get = op->Cast<LogicalGet>();
++	vector<unique_ptr<Expression>> exprs;
++	auto &ids = get.GetColumnIds();
++	auto bindings = get.GetColumnBindings();
++	for (auto &m : members) {
++		if (m.get_index != get.table_index) {
++			continue;
++		}
++		// the bitmap's range goes into the scan itself, where zone maps skip whole row groups (E is stored
++		// in source order); an empty bitmap empties the scan. Only for columns the scan reads.
++		bool scanned = false;
++		for (idx_t i = 0; i < ids.size(); i++) {
++			scanned |= !ids[i].IsRowIdColumn() && ids[i].GetPrimaryIndex() == m.column;
++		}
++		if (scanned) {
++			int64_t lo, hi;
++			Bounds(*bits[m.x], lo, hi);
++			auto type = get.returned_types[m.column];
++			get.table_filters.PushFilter(ColumnIndex(m.column),
++			                             make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
++			                                                       Value::BIGINT(lo).DefaultCastAs(type)));
++			get.table_filters.PushFilter(ColumnIndex(m.column),
++			                             make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO,
++			                                                       Value::BIGINT(hi).DefaultCastAs(type)));
++		}
++		for (idx_t i = 0; i < bindings.size(); i++) {
++			auto ci = bindings[i].column_index;
++			if (ci < ids.size() && !ids[ci].IsRowIdColumn() && ids[ci].GetPrimaryIndex() == m.column) {
++				auto type = get.types.size() > i ? get.types[i] : get.returned_types[m.column];
++				unique_ptr<Expression> col = make_uniq<BoundColumnRefExpression>(get.names[m.column], type, bindings[i]);
++				if (type.InternalType() != PhysicalType::INT32) {
++					col = BoundCastExpression::AddCastToType(context, std::move(col), LogicalType::BIGINT);
++				}
++				auto typed = fn;
++				typed.arguments = {col->return_type};
++				vector<unique_ptr<Expression>> args;
++				args.push_back(std::move(col));
++				exprs.push_back(make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, typed, std::move(args),
++				                                                   make_uniq<MemberData>(bits[m.x])));
++				break;
++			}
++		}
++	}
++	if (exprs.empty()) {
++		return;
++	}
++	auto filter = make_uniq<LogicalFilter>();
++	for (auto &e : exprs) {
++		filter->expressions.push_back(std::move(e));
++	}
++	filter->children.push_back(std::move(op));
++	filter->ResolveOperatorTypes();
++	op = std::move(filter);
++}
++
++// the host's join tree: comparison joins keep both inputs, scans of E and V copies are leaves, other
++// single-input operators are transparent; returns the node index or -1
++struct HostTree {
++	vector<int> left, right, edge, vertex;
++	int Build(LogicalOperator &op, const unordered_map<idx_t, int> &edge_of_get,
++	          const unordered_map<idx_t, int> &vertex_of_get) {
++		if (op.type == LogicalOperatorType::LOGICAL_GET) {
++			auto idx = op.Cast<LogicalGet>().table_index;
++			auto e = edge_of_get.find(idx);
++			auto v = vertex_of_get.find(idx);
++			if (e == edge_of_get.end() && v == vertex_of_get.end()) {
++				return -1;
++			}
++			return Add(-1, -1, e != edge_of_get.end() ? e->second : -1, v != vertex_of_get.end() ? v->second : -1);
++		}
++		vector<int> kids;
++		for (auto &child : op.children) {
++			int c = Build(*child, edge_of_get, vertex_of_get);
++			if (c >= 0) {
++				kids.push_back(c);
++			}
++		}
++		if (kids.empty()) {
++			return -1;
++		}
++		int node = kids[0];
++		for (idx_t i = 1; i < kids.size(); i++) {
++			node = Add(node, kids[i], -1, -1);
++		}
++		return node;
++	}
++	int Add(int l, int r, int e, int v) {
++		left.push_back(l);
++		right.push_back(r);
++		edge.push_back(e);
++		vertex.push_back(v);
++		return int(left.size()) - 1;
++	}
++};
++
++rptg_graph *EnsureGraph(ClientContext &context, unique_ptr<Connection> &conp, const string &key) {
++	auto &cache = Cache();
++	std::lock_guard<std::mutex> guard(cache.lock);
++	if (cache.graph && cache.key == key) {
++		return cache.graph;
++	}
++	if (!conp) {
++		conp = make_uniq<Connection>(*context.db);
++	}
++	auto &con = *conp;
++	auto t0 = std::chrono::steady_clock::now();
++	auto res = con.Query("SELECT src, dst FROM e");
++	if (res->HasError()) {
++		return nullptr;
++	}
++	vector<uint32_t> src, dst;
++	uint64_t n = 0;
++	for (auto &chunk : res->Cast<MaterializedQueryResult>().Collection().Chunks()) {
++		Vector s(LogicalType::BIGINT), d(LogicalType::BIGINT);
++		VectorOperations::Cast(*con.context, chunk.data[0], s, chunk.size());
++		VectorOperations::Cast(*con.context, chunk.data[1], d, chunk.size());
++		auto sp = FlatVector::GetData<int64_t>(s), dp = FlatVector::GetData<int64_t>(d);
++		for (idx_t i = 0; i < chunk.size(); i++) {
++			src.push_back(uint32_t(sp[i]));
++			dst.push_back(uint32_t(dp[i]));
++			n = MaxValue<uint64_t>(n, MaxValue<uint64_t>(sp[i], dp[i]) + 1);
++		}
++	}
++	auto vmax = con.Query("SELECT max(id) FROM v");
++	if (!vmax->HasError()) {
++		auto val = vmax->GetValue(0, 0);
++		if (!val.IsNull()) {
++			n = MaxValue<uint64_t>(n, uint64_t(val.GetValue<int64_t>()) + 1);
++		}
++	}
++	if (cache.graph) {
++		rptg_graph_free(cache.graph);
++	}
++	cache.graph = rptg_graph_build(n, src.size(), src.data(), dst.data());
++	cache.key = key;
++	cache.build_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++	if (Debug()) {
++		fprintf(stderr, "[rptg] adjacency index: n=%llu m=%llu in %.1f ms\n", (unsigned long long)n,
++		        (unsigned long long)src.size(), cache.build_ms);
++	}
++	return cache.graph;
++}
++
++} // namespace rptg_detail
++
++using namespace rptg_detail;
++
++unique_ptr<LogicalOperator> RPTGOptimizer::Optimize(ClientContext &context, unique_ptr<LogicalOperator> plan) {
++	if (!Enabled() || in_rptg) {
++		return plan;
++	}
++	auto t0 = std::chrono::steady_clock::now();
++	Recognizer rec(context);
++	rec.CollectBindings(*plan);
++	if (!rec.ok) {
++		return plan;
++	}
++	rec.CollectJoins(*plan);
++	if (!rec.ok || rec.gets.empty()) {
++		return plan;
++	}
++	// union-find over pattern columns: E.src / E.dst / V.id of every copy
++	std::map<std::pair<idx_t, idx_t>, int> node_of;
++	vector<int> parent;
++	auto node = [&](const Source &s) {
++		auto key = std::make_pair(s.get_index, s.column);
++		auto it = node_of.find(key);
++		if (it != node_of.end()) {
++			return it->second;
++		}
++		int id = int(parent.size());
++		parent.push_back(id);
++		node_of[key] = id;
++		return id;
++	};
++	std::function<int(int)> find = [&](int a) {
++		return parent[a] == a ? a : parent[a] = find(parent[a]);
++	};
++	idx_t e_src = DConstants::INVALID_INDEX, e_dst = DConstants::INVALID_INDEX, v_id = DConstants::INVALID_INDEX;
++	for (auto &g : rec.gets) {
++		auto table = g.second->GetTable();
++		if (rec.kind[g.first] == 1) {
++			e_src = table->GetColumn("src").Oid();
++			e_dst = table->GetColumn("dst").Oid();
++			node(Source {g.first, e_src});
++			node(Source {g.first, e_dst});
++		} else {
++			v_id = table->GetColumn("id").Oid();
++			node(Source {g.first, v_id});
++		}
++	}
++	for (auto &eq : rec.equalities) {
++		auto sl = node_of.find(std::make_pair(eq.first.get_index, eq.first.column));
++		auto sr = node_of.find(std::make_pair(eq.second.get_index, eq.second.column));
++		if (sl == node_of.end() || sr == node_of.end()) {
++			return plan; // an equality on another column: not a pattern query
++		}
++		parent[find(sl->second)] = find(sr->second);
++	}
++	// pattern vertices and edges
++	std::map<int, int> cls;
++	vector<int> ea, eb;
++	unordered_map<idx_t, int> edge_of_get, vertex_of_get;
++	auto class_of = [&](idx_t get, idx_t col) {
++		int root = find(node_of[std::make_pair(get, col)]);
++		auto it = cls.find(root);
++		if (it != cls.end()) {
++			return it->second;
++		}
++		int x = int(cls.size());
++		cls[root] = x;
++		return x;
++	};
++	for (auto idx : rec.leaf_order) {
++		if (rec.kind[idx] != 1) {
++			continue;
++		}
++		int a = class_of(idx, e_src), b = class_of(idx, e_dst);
++		if (a == b || cls.size() > MAXV) {
++			return plan;
++		}
++		edge_of_get[idx] = int(ea.size());
++		ea.push_back(a);
++		eb.push_back(b);
++	}
++	if (ea.empty()) {
++		return plan;
++	}
++	int k = int(cls.size());
++	vector<string> pred_sql(k);
++	vector<ColRange> range(k);
++	vector<bool> range_ok(k, true);
++	std::map<int, double> sel_of_vertex;
++	for (auto idx : rec.leaf_order) {
++		if (rec.kind[idx] != 2) {
++			continue;
++		}
++		auto root = find(node_of[std::make_pair(idx, v_id)]);
++		if (!cls.count(root)) {
++			return plan; // a V copy not attached to any edge
++		}
++		int x = cls[root];
++		vertex_of_get[idx] = x;
++		sel_of_vertex[x] = (sel_of_vertex.count(x) ? sel_of_vertex[x] : 1.0) * (rec.v_sel.count(idx) ? rec.v_sel[idx] : 1.0);
++		for (auto &f : rec.v_filters[idx]) {
++			pred_sql[x] += (pred_sql[x].empty() ? "" : " AND ") + f->ToString();
++			if (range_ok[x] && !ExprRange(*f, range[x])) {
++				range_ok[x] = false;
++			}
++		}
++	}
++	// host join order: start at the first scanned vertex, then bind vertices edge by edge
++	int start = -1;
++	for (auto idx : rec.leaf_order) {
++		if (rec.kind[idx] == 2) {
++			start = vertex_of_get[idx];
++			break;
++		}
++		if (rec.kind[idx] == 1) {
++			start = ea[edge_of_get[idx]];
++			break;
++		}
++	}
++	vector<int> sb, se;
++	{
++		vector<bool> bound(k, false), used(ea.size(), false);
++		bound[start] = true;
++		bool progress = true;
++		while (progress) {
++			progress = false;
++			for (auto idx : rec.leaf_order) {
++				if (rec.kind[idx] != 1) {
++					continue;
++				}
++				int e = edge_of_get[idx];
++				if (used[e]) {
++					continue;
++				}
++				if (bound[ea[e]] && bound[eb[e]]) {
++					used[e] = true;
++					progress = true;
++				} else if (bound[ea[e]] || bound[eb[e]]) {
++					int x = bound[ea[e]] ? ea[e] : eb[e];
++					sb.push_back(x);
++					se.push_back(e);
++					bound[x == ea[e] ? eb[e] : ea[e]] = true;
++					used[e] = true;
++					progress = true;
++					break;
++				}
++			}
++		}
++		for (int x = 0; x < k; x++) {
++			if (!bound[x]) {
++				return plan; // disconnected pattern
++			}
++		}
++	}
++	bool any_pred = false;
++	for (auto &p : pred_sql) {
++		any_pred |= !p.empty();
++	}
++	if (!any_pred) {
++		return plan;
++	}
++
++	// transfer phase on a side connection
++	in_rptg = true;
++	auto &cache = Cache();
++	if (cache.db != context.db.get()) {
++		cache.con.reset();
++		cache.db = context.db.get();
++	}
++	auto &conp = cache.con; // side connection, created when a query must run and kept for the process
++	auto graph = EnsureGraph(context, conp, "e");
++	if (!graph) {
++		in_rptg = false;
++		return plan;
++	}
++	auto t1 = std::chrono::steady_clock::now();
++	uint64_t words = (rptg_graph_n(graph) + 63) / 64;
++	rptg_pattern rp;
++	rp.k = k;
++	rp.nedges = int(ea.size());
++	rp.ea = ea.data();
++	rp.eb = eb.data();
++	rp.start = start;
++	rp.nsteps = int(sb.size());
++	rp.step_bound = sb.data();
++	rp.step_edge = se.data();
++	HostTree tree;
++	rp.plan_root = tree.Build(*plan, edge_of_get, vertex_of_get);
++	rp.nplan = rp.plan_root >= 0 ? int(tree.left.size()) : 0;
++	rp.plan_left = tree.left.data();
++	rp.plan_right = tree.right.data();
++	rp.plan_edge = tree.edge.data();
++	rp.plan_vertex = tree.vertex.data();
++	rp.plan_param = nullptr; // hash joins: every scan produces its own rows
++	rptg_options opt;
++	opt.beta = Beta();
++	opt.pred_cost = PredCost();
++	opt.first_cost = FirstCost();
++	opt.filter_cost = FilterCost();
++	opt.optimistic = 0;
++	char log[4096];
++	log[0] = 0;
++	// pre-screen on exact predicate counts (cheap in a column store); only the predicates whose
++	// information an admitted transfer carries are materialized
++	vector<double> est(k, -1.0), stats(5 * k, -1.0);
++	for (int x = 0; x < k; x++) {
++		if (!pred_sql[x].empty()) {
++			est[x] = double(rptg_graph_n(graph)) * (sel_of_vertex.count(x) ? sel_of_vertex[x] : DEFAULT_SEL);
++		}
++	}
++	vector<vector<uint64_t>> init_words(k);
++	vector<uint64_t *> init(k, nullptr);
++	vector<uint64_t> init_cnt(k, 0);
++	// materialize a set of predicates with one scan of V: the id and one boolean per predicate
++	auto materialize = [&](const vector<int> &xs) -> bool {
++		if (xs.empty()) {
++			return true;
++		}
++		string sel = "id", where;
++		for (idx_t j = 0; j < xs.size(); j++) {
++			sel += ", (" + pred_sql[xs[j]] + ")";
++			where += string(j ? " OR " : "") + "(" + pred_sql[xs[j]] + ")";
++			init_words[xs[j]].assign(words, 0);
++		}
++		if (!conp) {
++			conp = make_uniq<Connection>(*context.db);
++		}
++		auto res = conp->Query("SELECT " + sel + " FROM v WHERE " + where);
++		if (res->HasError()) {
++			if (Debug()) {
++				fprintf(stderr, "[rptg] predicate query failed: %s\n", res->GetError().c_str());
++			}
++			return false;
++		}
++		for (auto &chunk : res->Cast<MaterializedQueryResult>().Collection().Chunks()) {
++			Vector ids(LogicalType::BIGINT);
++			VectorOperations::Cast(*conp->context, chunk.data[0], ids, chunk.size());
++			auto ip = FlatVector::GetData<int64_t>(ids);
++			for (idx_t j = 0; j < xs.size(); j++) {
++				chunk.data[j + 1].Flatten(chunk.size());
++				auto bp = FlatVector::GetData<bool>(chunk.data[j + 1]);
++				auto &valid = FlatVector::Validity(chunk.data[j + 1]);
++				auto &w = init_words[xs[j]];
++				for (idx_t i = 0; i < chunk.size(); i++) {
++					uint64_t v = uint64_t(ip[i]);
++					if (valid.RowIsValid(i) && bp[i] && v < words * 64) {
++						w[v >> 6] |= 1ULL << (v & 63);
++					}
++				}
++			}
++		}
++		for (auto x : xs) {
++			init_cnt[x] = 0;
++			for (auto word : init_words[x]) {
++				init_cnt[x] += __builtin_popcountll(word);
++			}
++			init[x] = init_words[x].data();
++		}
++		return true;
++	};
++	// column indexes: exact sizes, degree sums, and moments of every range predicate by binary search, and
++	// materialization without a side query
++	vector<rptg_colindex *> cix(k, nullptr);
++	bool all_indexed = UseColumnIndex();
++	for (int x = 0; x < k && all_indexed; x++) {
++		if (pred_sql[x].empty()) {
++			continue;
++		}
++		if (!range_ok[x] || range[x].col.empty()) {
++			all_indexed = false;
++			break;
++		}
++		auto it = cache.colidx.find(range[x].col);
++		if (it == cache.colidx.end()) {
++			if (!conp) {
++				conp = make_uniq<Connection>(*context.db);
++			}
++			auto q = "SELECT id, CAST(" + KeywordHelper::WriteOptionallyQuoted(range[x].col) + " AS DOUBLE) FROM v WHERE " +
++			         KeywordHelper::WriteOptionallyQuoted(range[x].col) + " IS NOT NULL";
++			auto res = conp->Query(q);
++			if (res->HasError()) {
++				all_indexed = false;
++				break;
++			}
++			vector<uint32_t> ids;
++			vector<double> vals;
++			for (auto &chunk : res->Cast<MaterializedQueryResult>().Collection().Chunks()) {
++				Vector idv(LogicalType::BIGINT);
++				VectorOperations::Cast(*conp->context, chunk.data[0], idv, chunk.size());
++				chunk.data[1].Flatten(chunk.size());
++				auto ip = FlatVector::GetData<int64_t>(idv);
++				auto vp = FlatVector::GetData<double>(chunk.data[1]);
++				for (idx_t i = 0; i < chunk.size(); i++) {
++					if (ip[i] >= 0) {
++						ids.push_back(uint32_t(ip[i]));
++						vals.push_back(vp[i]);
++					}
++				}
++			}
++			it = cache.colidx.emplace(range[x].col, rptg_colindex_build(graph, ids.size(), ids.data(), vals.data())).first;
++			if (Debug()) {
++				fprintf(stderr, "[rptg] column index of v.%s: %zu rows\n", range[x].col.c_str(), ids.size());
++			}
++		}
++		cix[x] = it->second;
++	}
++	uint32_t needed = 0;
++	int admitted = 0;
++	if (all_indexed) {
++		for (int x = 0; x < k; x++) {
++			if (cix[x]) {
++				est[x] = double(rptg_colindex_range(cix[x], range[x].lo, range[x].lo_incl, range[x].hi, range[x].hi_incl,
++				                                    &stats[5 * x]));
++			}
++		}
++		opt.optimistic = 0;
++		opt.pred_cost = IndexPredCost();
++		opt.first_cost = IndexFirstCost();
++		admitted = rptg_prescreen(graph, &rp, est.data(), stats.data(), &opt, &needed, log, sizeof(log));
++		in_rptg = false;
++		if (admitted == 0) {
++			if (Debug()) {
++				fprintf(stderr, "[rptg] k=%d indexed pre-screen: no transfer admitted; %s\n", k, log);
++			}
++			return plan;
++		}
++		for (int x = 0; x < k; x++) {
++			if (cix[x] && ((needed >> x) & 1)) {
++				init_words[x].assign(words, 0);
++				rptg_colindex_bitmap(cix[x], range[x].lo, range[x].lo_incl, range[x].hi, range[x].hi_incl,
++				                     init_words[x].data());
++				init_cnt[x] = uint64_t(est[x]);
++				init[x] = init_words[x].data();
++			}
++		}
++	}
++	// level 1: pre-screen on estimated sizes with the largest degree sums such sets could have; if not even
++	// that admits a transfer, the query runs its plan untouched and no predicate is evaluated
++	opt.optimistic = 1;
++	if (!all_indexed) {
++		admitted = rptg_prescreen(graph, &rp, est.data(), nullptr, &opt, &needed, log, sizeof(log));
++	}
++	opt.optimistic = 0;
++	if (!all_indexed && admitted == 0) {
++		in_rptg = false;
++		if (Debug()) {
++			fprintf(stderr, "[rptg] k=%d optimistic pre-screen: no transfer admitted; %s\n", k, log);
++		}
++		return plan;
++	}
++	if (!all_indexed) {
++		// level 2: small predicate sets are materialized, so that the pre-screen sees their exact sizes, degree
++		// sums, and degree moments (hub sets look small but carry large degree sums)
++		vector<int> small;
++		for (int x = 0; x < k; x++) {
++			if (!pred_sql[x].empty() && est[x] <= ExactRows()) {
++				small.push_back(x);
++			}
++		}
++		if (!materialize(small)) {
++			in_rptg = false;
++			return plan;
++		}
++		for (auto x : small) {
++			uint64_t c;
++			rptg_bitmap_stats(graph, init[x], &c, &stats[5 * x]);
++			est[x] = double(c);
++		}
++		needed = 0;
++		admitted = rptg_prescreen(graph, &rp, est.data(), stats.data(), &opt, &needed, log, sizeof(log));
++		if (admitted > 0) {
++			vector<int> rest;
++			for (int x = 0; x < k; x++) {
++				if (!pred_sql[x].empty() && ((needed >> x) & 1) && !init[x]) {
++					rest.push_back(x);
++				}
++			}
++			if (!materialize(rest)) {
++				in_rptg = false;
++				return plan;
++			}
++		}
++	}
++	in_rptg = false;
++	auto t2 = std::chrono::steady_clock::now();
++	if (admitted == 0) {
++		if (Debug()) {
++			fprintf(stderr, "[rptg] k=%d pre-screen: no transfer admitted; %s\n", k, log);
++		}
++		return plan;
++	}
++	auto red = rptg_reduce(graph, &rp, init.data(), &opt, log, sizeof(log));
++	vector<shared_ptr<vector<uint64_t>>> bits(k);
++	int reduced = 0;
++	bool empty = false;
++	// self filters: predicate vertices whose own set filters scans that reach them before the predicate
++	uint32_t selff = rptg_self_filters(red);
++	for (int x = 0; x < k; x++) {
++		int full;
++		uint64_t cnt;
++		auto w = rptg_result(red, x, &full, &cnt);
++		if (!full && (!(init[x] && cnt >= init_cnt[x]) || ((selff >> x) & 1))) {
++			bits[x] = make_shared_ptr<vector<uint64_t>>(w, w + words);
++			reduced++;
++		}
++		empty |= !full && cnt == 0;
++	}
++	rptg_reduction_free(red);
++	// an empty candidate set proves the result empty: every vertex gets the empty set, every scan its
++	// filter, and the scans' min/max filters (lo > hi) skip every row group
++	if (empty) {
++		auto z = make_shared_ptr<vector<uint64_t>>(words, uint64_t(0));
++		for (int x = 0; x < k; x++) {
++			bits[x] = z;
++		}
++		reduced = k;
++	}
++	auto t3 = std::chrono::steady_clock::now();
++
++	// filter placement
++	Placement pl;
++	for (auto &g : rec.gets) {
++		uint32_t present = 0;
++		if (rec.kind[g.first] == 1) {
++			int e = edge_of_get[g.first];
++			present = (1u << ea[e]) | (1u << eb[e]);
++		} else {
++			present = 1u << vertex_of_get[g.first];
++		}
++		pl.classes[g.first] = present;
++		uint32_t kept = 0;
++		for (int x = 0; x < k; x++) {
++			if ((present >> x) & 1 && bits[x]) {
++				kept |= 1u << x;
++			}
++		}
++		pl.kept[g.first] = kept;
++	}
++	int nfilters = 0;
++	if (reduced > 0) {
++		if (!empty) {
++			pl.Visit(*plan);
++		}
++		vector<Member> members;
++		for (auto &g : rec.gets) {
++			for (int x = 0; x < k; x++) {
++				if (!((pl.kept[g.first] >> x) & 1)) {
++					continue;
++				}
++				if (rec.kind[g.first] == 1) {
++					int e = edge_of_get[g.first];
++					if (ea[e] == x) {
++						members.push_back(Member {g.first, e_src, x});
++					}
++					if (eb[e] == x) {
++						members.push_back(Member {g.first, e_dst, x});
++					}
++				} else {
++					members.push_back(Member {g.first, v_id, x});
++				}
++			}
++		}
++		nfilters = int(members.size());
++		ScalarFunction fn("rptg_member", {LogicalType::BIGINT}, LogicalType::BOOLEAN, MemberFunction);
++		InsertFilters(context, plan, members, bits, fn);
++	}
++	auto t4 = std::chrono::steady_clock::now();
++	if (Debug()) {
++		auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
++			return std::chrono::duration<double, std::milli>(b - a).count();
++		};
++		fprintf(stderr, "[rptg] k=%d edges=%d recognize %.2f ms, predicates %.2f ms, transfers %.2f ms, place %.2f ms; "
++		        "%d reduced vertices, %d filters; %s\n",
++		        k, int(ea.size()), ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), reduced, nfilters, log);
++	}
++	return plan;
++}
++
++} // namespace duckdb

@@ -1,0 +1,8 @@
+id=1 k=2 edges=0>1 preds=0:pu<0.01
+id=2 k=3 edges=0>1,1>2 preds=0:pu<0.001;2:pu<0.001
+id=3 k=4 edges=1>0,1>2,1>3 preds=0:label=3
+id=4 k=3 edges=0>1,1>2 preds=1:pu<0.0005
+id=5 k=3 edges=0>1,1>2
+id=6 k=4 edges=0>1,1>2,2>3 preds=0:pd<0.001;3:pu<0.5
+id=7 k=5 edges=0>1,1>2,1>3,3>4 preds=0:pu<0.02;2:label=7;4:pd<0.01
+id=8 k=3 edges=0>1,1>2 preds=0:pu<0.3;1:pu<0.3;2:pu<0.3

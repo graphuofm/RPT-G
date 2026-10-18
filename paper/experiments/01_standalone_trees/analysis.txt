@@ -1,0 +1,29 @@
+$ python scripts/analyze.py results/final25_dblp1k_main.csv --base M0
+queries: 1000   baseline: M0   timeouts per method: {'M0': 21, 'M6': 16, 'M7': 0, 'M8': 0}
+evaluated: 979 queries (baseline timeouts excluded: 21, below min-ms: 0)
+
+method    regr<0.9   <0.5   <0.1  geomean      P5     P50     P95      max      min  tmo
+M6            2.7%   0.0%   0.0%    1.073   0.941   0.999   1.191   1770.6   0.7437    0
+
+$ python scripts/analyze.py results/final25_dblp1k_base.csv --base M0
+queries: 1000   baseline: M0   timeouts per method: {'M0': 21, 'M3': 20, 'M4': 17}
+evaluated: 979 queries (baseline timeouts excluded: 21, below min-ms: 0)
+
+method    regr<0.9   <0.5   <0.1  geomean      P5     P50     P95      max      min  tmo
+M3           80.0%  66.2%  33.6%    0.181   0.013   0.225   1.010    437.2   0.0059    0
+M4           91.7%  82.3%  56.1%    0.051   0.001   0.070   0.982    304.9   0.0003    0
+
+$ python scripts/analyze.py results/final25_lj1k_main.csv --base M0
+queries: 1000   baseline: M0   timeouts per method: {'M0': 224, 'M6': 199, 'M7': 5, 'M8': 2}
+evaluated: 776 queries (baseline timeouts excluded: 224, below min-ms: 0)
+
+method    regr<0.9   <0.5   <0.1  geomean      P5     P50     P95      max      min  tmo
+M6            3.0%   0.4%   0.0%    1.118   0.942   1.000   2.569     56.6   0.3548    0
+
+$ python scripts/analyze.py results/final25_lj1k_base.csv --base M0
+queries: 1000   baseline: M0   timeouts per method: {'M0': 243, 'M3': 238, 'M4': 224}
+evaluated: 757 queries (baseline timeouts excluded: 243, below min-ms: 0)
+
+method    regr<0.9   <0.5   <0.1  geomean      P5     P50     P95      max      min  tmo
+M3           85.2%  62.6%  32.0%    0.192   0.011   0.297   1.048      6.4   0.0036    0
+M4           93.8%  83.6%  57.5%    0.053   0.001   0.055   1.251     24.4   0.0002    5
